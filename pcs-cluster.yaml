@@ -1,0 +1,891 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: AWS PCS HPC Environment - Slurm cluster with login and dynamic compute nodes
+
+Parameters:
+  ClusterName:
+    Type: String
+    Default: hpc-cluster
+    Description: Name for the PCS cluster
+  MaxComputeNodes:
+    Type: Number
+    Default: 10
+    Description: Maximum number of dynamic compute nodes
+  AmiId:
+    Type: AWS::EC2::Image::Id
+    Description: PCS-ready AMI ID (find via aws ec2 describe-images --owners amazon --filters "Name=name,Values=aws-pcs-ready-dlami-base-ubuntu2404*")
+  ExistingVpcId:
+    Type: String
+    Default: ""
+    Description: Existing VPC ID (leave empty to create a new VPC)
+  ExistingSubnetId1:
+    Type: String
+    Default: ""
+    Description: Existing Subnet ID in AZ 1 (leave empty to create a new subnet)
+  ExistingSubnetId2:
+    Type: String
+    Default: ""
+    Description: Existing Subnet ID in AZ 2 (leave empty to create a new subnet)
+  ExistingSecurityGroupId:
+    Type: String
+    Default: ""
+    Description: Existing Security Group ID (leave empty to create a new one)
+  PwbLicense:
+    Type: String
+    Default: ""
+    Description: Posit Workbench license key
+  PwbVersion:
+    Type: String
+    Default: "2026.05.1-225.pro10"
+    Description: Full Posit Workbench version (e.g. 2026.05.1-225.pro10)
+  PwbVersionShort:
+    Type: String
+    Default: "2026.05.1"
+    Description: Short Posit Workbench version (e.g. 2026.05.1)
+  ConfigBucket:
+    Type: String
+    Default: ""
+    Description: S3 bucket name containing config files (leave empty to skip config sync)
+  ConfigPrefix:
+    Type: String
+    Default: rstudio/config
+    Description: S3 key prefix for config files within the bucket
+  CertificateArn:
+    Type: String
+    Default: ""
+    Description: ACM certificate ARN for TLS termination on the NLB (leave empty to skip NLB creation)
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+    Description: VPC CIDR (used for new VPC creation and NLB health check ingress rules)
+  SubnetCidr:
+    Type: String
+    Default: 10.0.1.0/24
+    Description: Subnet CIDR (only used if creating new subnet)
+  RdsSecurityGroupId:
+    Type: String
+    Default: ""
+    Description: RDS security group ID (PCS stack will add ingress rule allowing access on port 5432)
+  RdsEndpoint:
+    Type: String
+    Default: ""
+    Description: RDS endpoint hostname (passed to login node UserData for database config)
+  RdsPassword:
+    Type: String
+    Default: ""
+    NoEcho: true
+    Description: RDS master password (passed to login node UserData for database config)
+
+Conditions:
+  CreateVpc: !Equals [!Ref ExistingVpcId, ""]
+  CreateSubnet: !Equals [!Ref ExistingSubnetId1, ""]
+  CreateSecurityGroup: !Equals [!Ref ExistingSecurityGroupId, ""]
+  CreateNlb: !Not [!Equals [!Ref CertificateArn, ""]]
+  HasRds: !Not [!Equals [!Ref RdsSecurityGroupId, ""]]
+
+Resources:
+  # --- Networking (conditional) ---
+
+  Vpc:
+    Type: AWS::EC2::VPC
+    Condition: CreateVpc
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ClusterName}-vpc"
+
+  Subnet:
+    Type: AWS::EC2::Subnet
+    Condition: CreateSubnet
+    Properties:
+      VpcId: !If [CreateVpc, !Ref Vpc, !Ref ExistingVpcId]
+      CidrBlock: !Ref SubnetCidr
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ClusterName}-subnet"
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Condition: CreateVpc
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub "${ClusterName}-igw"
+
+  GatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Condition: CreateVpc
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Condition: CreateVpc
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${ClusterName}-rt"
+
+  DefaultRoute:
+    Type: AWS::EC2::Route
+    Condition: CreateVpc
+    DependsOn: GatewayAttachment
+    Properties:
+      RouteTableId: !Ref RouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  SubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: CreateSubnet
+    Properties:
+      SubnetId: !If [CreateSubnet, !Ref Subnet, !Ref ExistingSubnetId1]
+      RouteTableId: !Ref RouteTable
+
+  ClusterSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: CreateSecurityGroup
+    Properties:
+      GroupDescription: Security group for PCS cluster nodes
+      VpcId: !If [CreateVpc, !Ref Vpc, !Ref ExistingVpcId]
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub "${ClusterName}-sg"
+
+  SecurityGroupSelfIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId:
+        !If [
+          CreateSecurityGroup,
+          !GetAtt ClusterSecurityGroup.GroupId,
+          !Ref ExistingSecurityGroupId,
+        ]
+      IpProtocol: "-1"
+      SourceSecurityGroupId:
+        !If [
+          CreateSecurityGroup,
+          !GetAtt ClusterSecurityGroup.GroupId,
+          !Ref ExistingSecurityGroupId,
+        ]
+
+  # --- NLB health check ingress (conditional) ---
+
+  NlbSshIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: CreateNlb
+    Properties:
+      GroupId:
+        !If [
+          CreateSecurityGroup,
+          !GetAtt ClusterSecurityGroup.GroupId,
+          !Ref ExistingSecurityGroupId,
+        ]
+      IpProtocol: tcp
+      FromPort: 22
+      ToPort: 22
+      CidrIp: !Ref VpcCidr
+
+  NlbHttpsIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: CreateNlb
+    Properties:
+      GroupId:
+        !If [
+          CreateSecurityGroup,
+          !GetAtt ClusterSecurityGroup.GroupId,
+          !Ref ExistingSecurityGroupId,
+        ]
+      IpProtocol: tcp
+      FromPort: 8787
+      ToPort: 8787
+      CidrIp: !Ref VpcCidr
+
+  NlbDcvIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: CreateNlb
+    Properties:
+      GroupId:
+        !If [
+          CreateSecurityGroup,
+          !GetAtt ClusterSecurityGroup.GroupId,
+          !Ref ExistingSecurityGroupId,
+        ]
+      IpProtocol: tcp
+      FromPort: 8443
+      ToPort: 8443
+      CidrIp: !Ref VpcCidr
+
+  # --- RDS access (conditional) ---
+
+  RdsIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: HasRds
+    Properties:
+      GroupId: !Ref RdsSecurityGroupId
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      SourceSecurityGroupId:
+        !If [
+          CreateSecurityGroup,
+          !GetAtt ClusterSecurityGroup.GroupId,
+          !Ref ExistingSecurityGroupId,
+        ]
+
+  # --- EFS ---
+
+  EfsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow NFS from PCS nodes
+      VpcId: !If [CreateVpc, !Ref Vpc, !Ref ExistingVpcId]
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          SourceSecurityGroupId:
+            !If [
+              CreateSecurityGroup,
+              !GetAtt ClusterSecurityGroup.GroupId,
+              !Ref ExistingSecurityGroupId,
+            ]
+      Tags:
+        - Key: Name
+          Value: !Sub "${ClusterName}-efs-sg"
+
+  SharedFileSystem:
+    Type: AWS::EFS::FileSystem
+    Properties:
+      PerformanceMode: generalPurpose
+      ThroughputMode: elastic
+      Encrypted: true
+
+  EfsMountTarget1:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref SharedFileSystem
+      SubnetId: !If [CreateSubnet, !Ref Subnet, !Ref ExistingSubnetId1]
+      SecurityGroups:
+        - !Ref EfsSecurityGroup
+
+  EfsMountTarget2:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref SharedFileSystem
+      SubnetId: !Ref ExistingSubnetId2
+      SecurityGroups:
+        - !Ref EfsSecurityGroup
+
+  HomeAccessPoint:
+    Type: AWS::EFS::AccessPoint
+    Properties:
+      FileSystemId: !Ref SharedFileSystem
+      RootDirectory:
+        Path: /home
+        CreationInfo:
+          OwnerUid: "0"
+          OwnerGid: "0"
+          Permissions: "0755"
+
+  OptAccessPoint:
+    Type: AWS::EFS::AccessPoint
+    Properties:
+      FileSystemId: !Ref SharedFileSystem
+      RootDirectory:
+        Path: /opt-shared
+        CreationInfo:
+          OwnerUid: "0"
+          OwnerGid: "0"
+          Permissions: "0755"
+
+  # --- IAM ---
+
+  PcsNodeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "AWSPCSNodeRole-${ClusterName}"
+      Path: /aws-pcs/
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: PCSNodePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - pcs:RegisterComputeNodeGroupInstance
+                  - ec2:RunInstances
+                  - ec2:CreateTags
+                  - ec2:DescribeInstances
+                  - ec2:DescribeInstanceStatus
+                  - ec2:TerminateInstances
+                  - ec2:DescribeSubnets
+                  - ec2:DescribeSecurityGroups
+                  - ec2:DescribeLaunchTemplates
+                  - ec2:DescribeLaunchTemplateVersions
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub "arn:aws:s3:::${ConfigBucket}"
+                  - !Sub "arn:aws:s3:::${ConfigBucket}/*"
+
+  PcsInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub "AWSPCSProfile-${ClusterName}"
+      Path: /aws-pcs/
+      Roles:
+        - !Ref PcsNodeRole
+
+  # --- Launch Templates ---
+
+  LoginLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub "${ClusterName}-login-lt"
+      LaunchTemplateData:
+        InstanceType: t3.large
+        SecurityGroupIds:
+          - !If [
+              CreateSecurityGroup,
+              !GetAtt ClusterSecurityGroup.GroupId,
+              !Ref ExistingSecurityGroupId,
+            ]
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: rs:project
+                Value: solutions
+              - Key: rs:environment
+                Value: development
+              - Key: rs:owner
+                Value: michael.mayer@posit.co
+              - Key: Name
+                Value: !Sub "${ClusterName}-login"
+        UserData:
+          Fn::Base64: !Sub |
+            Content-Type: multipart/mixed; boundary="==BOUNDARY=="
+            MIME-Version: 1.0
+
+            --==BOUNDARY==
+            Content-Type: text/x-shellscript; charset="us-ascii"
+            MIME-Version: 1.0
+
+            #!/bin/bash
+            set -euo pipefail
+            exec > /var/log/pcs-login-init.log 2>&1
+            echo "Login node bootstrap starting..."
+
+            # Make sure that cloud formation of EC2 bootup has run 
+            echo "sleeping for 2 minutes for EC2 bootup cloud formation to finish..."
+            sleep 120
+            until apt-get -o DPkg::Lock::Timeout=300 update; do
+              echo "apt-get update failed, retrying in 10s..."
+              sleep 10
+            done
+
+            # Mount shared EFS
+            apt-get install -y nfs-common amazon-efs-utils
+            EFS_DNS=${SharedFileSystem}.efs.${AWS::Region}.amazonaws.com
+
+            # Mount root to create subdirectories
+            mkdir -p /mnt/efs
+            mount -t nfs4 -o nfsvers=4.1,rsize=1048576,wsize=1048576,hard,timeo=600,retrans=2 \
+              $EFS_DNS:/ /mnt/efs
+            mkdir -p /mnt/efs/home /mnt/efs/opt-shared
+            umount /mnt/efs
+
+            # Mount subdirectories
+            mkdir -p /home /opt/shared
+            mount -t nfs4 -o nfsvers=4.1,rsize=1048576,wsize=1048576,hard,timeo=600,retrans=2 \
+              $EFS_DNS:/home /home
+            mount -t nfs4 -o nfsvers=4.1,rsize=1048576,wsize=1048576,hard,timeo=600,retrans=2 \
+              $EFS_DNS:/opt-shared /opt/shared
+
+            # Persist mounts across reboots
+            echo "$EFS_DNS:/home /home nfs4 nfsvers=4.1,rsize=1048576,wsize=1048576,hard,timeo=600,retrans=2,_netdev 0 0" >> /etc/fstab
+            echo "$EFS_DNS:/opt-shared /opt/shared nfs4 nfsvers=4.1,rsize=1048576,wsize=1048576,hard,timeo=600,retrans=2,_netdev 0 0" >> /etc/fstab
+
+            # Install R
+            R_VERSION=4.6.0
+            curl -Lo /tmp/r-${!R_VERSION}_1_amd64.deb \
+              https://cdn.posit.co/r/ubuntu-2404/pkgs/r-${!R_VERSION}_1_amd64.deb
+            apt-get install -y /tmp/r-${!R_VERSION}_1_amd64.deb
+
+            # Install Posit Workbench
+            curl -Lo /tmp/rstudio-workbench.deb \
+              https://download2.rstudio.org/server/jammy/amd64/rstudio-workbench-${PwbVersionShort}-amd64.deb
+            apt-get install -y /tmp/rstudio-workbench.deb
+
+            # Ensure rstudio-launcher sources Slurm environment
+            mkdir -p /etc/systemd/system/rstudio-launcher.service.d
+            printf '%s\n' \
+              '[Service]' \
+              'ExecStart=' \
+              'ExecStart=/bin/bash -c "source /etc/profile.d/slurm.sh && exec /usr/lib/rstudio-server/bin/rstudio-launcher"' \
+              > /etc/systemd/system/rstudio-launcher.service.d/slurm-env.conf
+            systemctl daemon-reload
+
+            # One-time S3 config sync (first node only)
+            if mkdir /opt/shared/.s3-sync-lock 2>/dev/null; then
+              if [ ! -f /opt/shared/.s3-sync-complete ]; then
+                echo "First node - syncing config from S3..."
+                CONFIG_BUCKET="${ConfigBucket}"
+                if [ -n "$CONFIG_BUCKET" ]; then
+                  mkdir -p /opt/shared/rstudio/config
+                  aws s3 sync "s3://$CONFIG_BUCKET/${ConfigPrefix}/" /opt/shared/rstudio/config/
+                  
+                  # install uuid-runtime and openssl
+                  apt-get install -y uuid-runtime openssl
+
+                  # Generate secure-cookie-key
+                  uuidgen > /opt/shared/rstudio/config/secure-cookie-key
+                  
+                  # Restrict permissions 
+                  chmod 0600 /opt/shared/rstudio/config/secure-cookie-key
+
+                  # Generate the private key
+                  openssl genpkey -algorithm RSA -out /opt/shared/rstudio/config/launcher.pem -pkeyopt rsa_keygen_bits:2048
+
+                  # Generate the public key from the private key
+                  openssl rsa -in /opt/shared/rstudio/config/launcher.pem -pubout > /opt/shared/rstudio/config/launcher.pub
+
+                  # Restrict permissions on the private key
+                  chmod 0600 /opt/shared/rstudio/config/launcher.pem
+                fi
+                # Create audit database on RDS
+                if [ -n "${RdsEndpoint}" ]; then
+                  apt-get install -y postgresql-client
+                  PGPASSWORD="${RdsPassword}" psql -h "${RdsEndpoint}" -U rstudio -d pwb \
+                    -c "CREATE DATABASE pwb_audit OWNER rstudio;" || true
+                fi
+                touch /opt/shared/.s3-sync-complete
+              fi
+              rmdir /opt/shared/.s3-sync-lock
+            else
+              echo "Another node is syncing config, waiting..."
+              while [ ! -f /opt/shared/.s3-sync-complete ]; do sleep 5; done
+            fi
+
+            # Provision test users
+            for i in $(seq -w 1 5); do
+              USER="posit0${!i}"
+              id "$USER" &>/dev/null || useradd -m -u "200${!i}" -s /bin/bash "$USER"
+              echo "$USER:rstudio" | chpasswd
+            done
+
+            # Deploy shared config files from EFS
+            if [ -d /opt/shared/rstudio/config ]; then
+              cp -r /opt/shared/rstudio/config/* /etc/rstudio/ 2>/dev/null || true
+              echo -e "provider=postgresql\nconnection-uri=postgresql://rstudio:${RdsPassword}@${RdsEndpoint}/pwb" > /etc/rstudio/database.conf
+              echo -e "provider=postgresql\nconnection-uri=postgresql://rstudio:${RdsPassword}@${RdsEndpoint}/pwb_audit" > /etc/rstudio/audit-database.conf
+              
+            fi
+
+            # One-time squashfs build (first node only)
+            if mkdir /opt/shared/.squashfs-lock 2>/dev/null; then
+              if [ ! -f /opt/shared/.squashfs-complete ]; then
+                echo "First node - building squashfs image..."
+                apt-get install -y squashfs-tools
+                SQSH_DIR=/opt/shared/rstudio/session-components
+                SQSH_FILE="${!SQSH_DIR}/rsw-session-${PwbVersion}.sqsh"
+                mkdir -p "${!SQSH_DIR}/downloads"
+                if [ ! -f "${!SQSH_FILE}" ]; then
+                  curl -Lo "${!SQSH_DIR}/downloads/rsp-session-jammy-${PwbVersion}-amd64.tar.gz" \
+                    "https://s3.amazonaws.com/rstudio-ide-build/session/jammy/amd64/rsp-session-jammy-${PwbVersion}-amd64.tar.gz"
+                  TMPDIR=$(mktemp -d)
+                  chmod 755 "$TMPDIR"
+                  tar xzf "${!SQSH_DIR}/downloads/rsp-session-jammy-${PwbVersion}-amd64.tar.gz" -C "$TMPDIR" --strip-components=1
+                  mksquashfs "$TMPDIR" "${!SQSH_FILE}" -comp zstd -noappend
+                  rm -rf "$TMPDIR"
+                fi
+                touch /opt/shared/.squashfs-complete
+              fi
+              rmdir /opt/shared/.squashfs-lock
+            else
+              echo "Another node is building squashfs, waiting..."
+              while [ ! -f /opt/shared/.squashfs-complete ]; do sleep 5; done
+            fi
+
+            # Install XFCE desktop environment
+            apt-get install -y xfce4 xfce4-goodies dbus-x11
+
+            # Install Amazon DCV
+            wget https://d1uj6qtbmh3dt5.cloudfront.net/NICE-GPG-KEY
+            gpg --import NICE-GPG-KEY
+            wget https://d1uj6qtbmh3dt5.cloudfront.net/2024.0/Servers/nice-dcv-2024.0-17979-ubuntu2404-x86_64.tgz
+            tar xzf nice-dcv-2024.0-17979-ubuntu2404-x86_64.tgz
+            cd nice-dcv-2024.0-17979-ubuntu2404-x86_64
+            apt-get install -y ./nice-dcv-server_*.deb ./nice-dcv-web-viewer_*.deb ./nice-xdcv_*.deb
+            cd /
+            rm -rf /nice-dcv-* /NICE-GPG-KEY
+
+            # Configure DCV for virtual sessions
+            printf '%s\n' \
+              '[license]' \
+              '[log]' \
+              '[session-management]' \
+              'virtual-session-xdcv-args="-listen tcp"' \
+              '[session-management/defaults]' \
+              '[session-management/automatic-console-session]' \
+              '[display]' \
+              '[connectivity]' \
+              'web-port=8443' \
+              'quic-port=8443' \
+              '[security]' \
+              'authentication="system"' \
+              > /etc/dcv/dcv.conf
+
+            # Enable and start DCV server
+            systemctl enable dcvserver
+            systemctl start dcvserver
+
+            # Create a virtual session per test user
+            for i in $(seq -w 1 5); do
+              USER="posit0${!i}"
+              dcv create-session --type=virtual --owner "$USER" "$USER"
+            done
+
+            # activate PWB license 
+            /usr/lib/rstudio-server/bin/license-manager activate ${PwbLicense}
+
+            # stop rstudio server and launcher - clean out log files and restart 
+            rstudio-server stop 
+            rstudio-launcher stop 
+            rm -rf /var/log/rstudio/*/*
+            rstudio-launcher start
+            rstudio-server start 
+
+            echo "Login node bootstrap complete."
+            --==BOUNDARY==--
+
+  ComputeLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub "${ClusterName}-compute-lt"
+      LaunchTemplateData:
+        InstanceType: t3.large
+        SecurityGroupIds:
+          - !If [
+              CreateSecurityGroup,
+              !GetAtt ClusterSecurityGroup.GroupId,
+              !Ref ExistingSecurityGroupId,
+            ]
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: rs:project
+                Value: solutions
+              - Key: rs:environment
+                Value: development
+              - Key: rs:owner
+                Value: michael.mayer@posit.co
+              - Key: Name
+                Value: !Sub "${ClusterName}-compute"
+        UserData:
+          Fn::Base64: !Sub |
+            Content-Type: multipart/mixed; boundary="==BOUNDARY=="
+            MIME-Version: 1.0
+
+            --==BOUNDARY==
+            Content-Type: text/x-shellscript; charset="us-ascii"
+            MIME-Version: 1.0
+
+            #!/bin/bash
+            set -euo pipefail
+            exec > /var/log/pcs-compute-init.log 2>&1
+            echo "Compute node bootstrap starting..."
+
+            # Make sure that cloud formation of EC2 bootup has run 
+            echo "sleeping for 2 minutes for EC2 bootup cloud formation to finish..."
+            sleep 120
+            until apt-get -o DPkg::Lock::Timeout=300 update; do
+              echo "apt-get update failed, retrying in 10s..."
+              sleep 10
+            done
+
+            # Mount shared EFS
+            apt-get install -y nfs-common amazon-efs-utils
+            EFS_DNS=${SharedFileSystem}.efs.${AWS::Region}.amazonaws.com
+
+            # Mount root to ensure subdirectories exist
+            mkdir -p /mnt/efs
+            mount -t nfs4 -o nfsvers=4.1,rsize=1048576,wsize=1048576,hard,timeo=600,retrans=2 \
+              $EFS_DNS:/ /mnt/efs
+            mkdir -p /mnt/efs/home /mnt/efs/opt-shared
+            umount /mnt/efs
+
+            # Mount subdirectories
+            mkdir -p /home /opt/shared
+            mount -t nfs4 -o nfsvers=4.1,rsize=1048576,wsize=1048576,hard,timeo=600,retrans=2 \
+              $EFS_DNS:/home /home
+            mount -t nfs4 -o nfsvers=4.1,rsize=1048576,wsize=1048576,hard,timeo=600,retrans=2 \
+              $EFS_DNS:/opt-shared /opt/shared
+
+            # Persist mounts across reboots
+            echo "$EFS_DNS:/home /home nfs4 nfsvers=4.1,rsize=1048576,wsize=1048576,hard,timeo=600,retrans=2,_netdev 0 0" >> /etc/fstab
+            echo "$EFS_DNS:/opt-shared /opt/shared nfs4 nfsvers=4.1,rsize=1048576,wsize=1048576,hard,timeo=600,retrans=2,_netdev 0 0" >> /etc/fstab
+
+            # Install R
+            R_VERSION=4.6.0
+            curl -Lo /tmp/r-${!R_VERSION}_1_amd64.deb \
+              https://cdn.posit.co/r/ubuntu-2404/pkgs/r-${!R_VERSION}_1_amd64.deb
+            apt-get install -y /tmp/r-${!R_VERSION}_1_amd64.deb
+
+            # Provision test users
+            for i in $(seq -w 1 5); do
+              USER="posit0${!i}"
+              id "$USER" &>/dev/null || useradd -m -u "200${!i}" -s /bin/bash "$USER"
+              echo "$USER:rstudio" | chpasswd
+            done
+
+            # Mount squashfs session components from shared EFS
+            SQSH_FILE=/opt/shared/rstudio/session-components/rsw-session-${PwbVersion}.sqsh
+            echo "Waiting for squashfs image..."
+            while [ ! -f "${!SQSH_FILE}" ]; do sleep 5; done
+            rm -rf /usr/lib/rstudio-server
+            mkdir -p /usr/lib/rstudio-server
+            mount -t squashfs -o ro,loop,threads=multi "${!SQSH_FILE}" /usr/lib/rstudio-server
+            echo "${!SQSH_FILE} /usr/lib/rstudio-server squashfs ro,loop,threads=multi,_netdev 0 0" >> /etc/fstab
+
+            # Make sure system dependencies for session components are there 
+            apt-get install -y curl libcurl4-gnutls-dev libssl-dev libpq5 rrdtool
+            echo "Compute node bootstrap complete."
+            --==BOUNDARY==--
+
+  # --- PCS Cluster (Head Node) ---
+
+  PcsCluster:
+    Type: AWS::PCS::Cluster
+    DependsOn: SecurityGroupSelfIngress
+    Properties:
+      Name: !Ref ClusterName
+      Size: SMALL
+      Scheduler:
+        Type: SLURM
+        Version: "25.11"
+      Networking:
+        SubnetIds:
+          - !If [CreateSubnet, !Ref Subnet, !Ref ExistingSubnetId1]
+        SecurityGroupIds:
+          - !If [
+              CreateSecurityGroup,
+              !GetAtt ClusterSecurityGroup.GroupId,
+              !Ref ExistingSecurityGroupId,
+            ]
+
+  # --- Login Node Group (2 static nodes) ---
+
+  LoginNodeGroup:
+    Type: AWS::PCS::ComputeNodeGroup
+    Properties:
+      Name: login-nodes
+      ClusterId: !GetAtt PcsCluster.Id
+      AmiId: !Ref AmiId
+      CustomLaunchTemplate:
+        TemplateId: !Ref LoginLaunchTemplate
+        Version: !GetAtt LoginLaunchTemplate.LatestVersionNumber
+      IamInstanceProfileArn: !GetAtt PcsInstanceProfile.Arn
+      InstanceConfigs:
+        - InstanceType: t3.large
+      ScalingConfiguration:
+        MinInstanceCount: 2
+        MaxInstanceCount: 2
+      SubnetIds:
+        - !If [CreateSubnet, !Ref Subnet, !Ref ExistingSubnetId1]
+        - !Ref ExistingSubnetId2
+      PurchaseOption: ONDEMAND
+
+  # --- Compute Node Group (fully dynamic) ---
+
+  ComputeNodeGroup:
+    Type: AWS::PCS::ComputeNodeGroup
+    Properties:
+      Name: compute-nodes
+      ClusterId: !GetAtt PcsCluster.Id
+      AmiId: !Ref AmiId
+      CustomLaunchTemplate:
+        TemplateId: !Ref ComputeLaunchTemplate
+        Version: !GetAtt ComputeLaunchTemplate.LatestVersionNumber
+      IamInstanceProfileArn: !GetAtt PcsInstanceProfile.Arn
+      InstanceConfigs:
+        - InstanceType: t3.large
+      ScalingConfiguration:
+        MinInstanceCount: 0
+        MaxInstanceCount: !Ref MaxComputeNodes
+      SubnetIds:
+        - !If [CreateSubnet, !Ref Subnet, !Ref ExistingSubnetId1]
+        - !Ref ExistingSubnetId2
+      PurchaseOption: ONDEMAND
+
+  # --- Queues ---
+
+  LoginQueue:
+    Type: AWS::PCS::Queue
+    Properties:
+      Name: login
+      ClusterId: !GetAtt PcsCluster.Id
+      ComputeNodeGroupConfigurations:
+        - ComputeNodeGroupId: !GetAtt LoginNodeGroup.Id
+
+  ComputeQueue:
+    Type: AWS::PCS::Queue
+    Properties:
+      Name: compute
+      ClusterId: !GetAtt PcsCluster.Id
+      ComputeNodeGroupConfigurations:
+        - ComputeNodeGroupId: !GetAtt ComputeNodeGroup.Id
+
+  # --- NLB (conditional) ---
+
+  NetworkLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Condition: CreateNlb
+    Properties:
+      Name: !Sub "${ClusterName}-nlb"
+      Scheme: internal
+      Type: network
+      Subnets:
+        - !If [CreateSubnet, !Ref Subnet, !Ref ExistingSubnetId1]
+        - !Ref ExistingSubnetId2
+
+  SshTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Condition: CreateNlb
+    Properties:
+      Name: !Sub "${ClusterName}-ssh"
+      Port: 22
+      Protocol: TCP
+      VpcId: !If [CreateVpc, !Ref Vpc, !Ref ExistingVpcId]
+      TargetType: ip
+      HealthCheckProtocol: TCP
+      HealthCheckPort: "22"
+      TargetGroupAttributes:
+        - Key: stickiness.enabled
+          Value: "true"
+        - Key: stickiness.type
+          Value: source_ip
+
+  HttpsTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Condition: CreateNlb
+    Properties:
+      Name: !Sub "${ClusterName}-https"
+      Port: 8787
+      Protocol: TCP
+      VpcId: !If [CreateVpc, !Ref Vpc, !Ref ExistingVpcId]
+      TargetType: ip
+      HealthCheckProtocol: HTTP
+      HealthCheckPort: "8787"
+      HealthCheckPath: /
+      Matcher:
+        HttpCode: "302"
+      TargetGroupAttributes:
+        - Key: stickiness.enabled
+          Value: "true"
+        - Key: stickiness.type
+          Value: source_ip
+
+  SshListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: CreateNlb
+    Properties:
+      LoadBalancerArn: !Ref NetworkLoadBalancer
+      Port: 22
+      Protocol: TCP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref SshTargetGroup
+
+  HttpsListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: CreateNlb
+    Properties:
+      LoadBalancerArn: !Ref NetworkLoadBalancer
+      Port: 443
+      Protocol: TLS
+      Certificates:
+        - CertificateArn: !Ref CertificateArn
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref HttpsTargetGroup
+
+  DcvTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Condition: CreateNlb
+    Properties:
+      Name: !Sub "${ClusterName}-dcv"
+      Port: 8443
+      Protocol: TCP
+      VpcId: !If [CreateVpc, !Ref Vpc, !Ref ExistingVpcId]
+      TargetType: ip
+      HealthCheckProtocol: TCP
+      HealthCheckPort: "8443"
+      TargetGroupAttributes:
+        - Key: stickiness.enabled
+          Value: "true"
+        - Key: stickiness.type
+          Value: source_ip
+
+  DcvListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: CreateNlb
+    Properties:
+      LoadBalancerArn: !Ref NetworkLoadBalancer
+      Port: 8443
+      Protocol: TCP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref DcvTargetGroup
+
+Outputs:
+  ClusterId:
+    Value: !GetAtt PcsCluster.Id
+    Description: PCS Cluster ID
+  ClusterArn:
+    Value: !GetAtt PcsCluster.Arn
+    Description: PCS Cluster ARN
+  VpcId:
+    Value: !If [CreateVpc, !Ref Vpc, !Ref ExistingVpcId]
+    Description: VPC ID
+  SubnetId1:
+    Value: !If [CreateSubnet, !Ref Subnet, !Ref ExistingSubnetId1]
+    Description: Subnet ID (AZ 1)
+  SubnetId2:
+    Value: !Ref ExistingSubnetId2
+    Description: Subnet ID (AZ 2)
+  SecurityGroupId:
+    Value:
+      !If [
+        CreateSecurityGroup,
+        !GetAtt ClusterSecurityGroup.GroupId,
+        !Ref ExistingSecurityGroupId,
+      ]
+    Description: Security Group ID
+  EfsFileSystemId:
+    Value: !Ref SharedFileSystem
+    Description: Shared EFS filesystem ID
+  NlbDnsName:
+    Condition: CreateNlb
+    Value: !GetAtt NetworkLoadBalancer.DNSName
+    Description: NLB DNS name for SSH and HTTPS access

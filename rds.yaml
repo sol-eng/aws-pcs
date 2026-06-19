@@ -1,0 +1,84 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: RDS PostgreSQL instance accessible only from PCS login nodes
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC where RDS will be deployed
+  SubnetId1:
+    Type: AWS::EC2::Subnet::Id
+    Description: First subnet for DB subnet group (AZ 1)
+  SubnetId2:
+    Type: AWS::EC2::Subnet::Id
+    Description: Second subnet for DB subnet group (AZ 2 - required by RDS)
+  DBName:
+    Type: String
+    Default: pwb
+    AllowedPattern: "[a-zA-Z][a-zA-Z0-9]*"
+  DBMasterUsername:
+    Type: String
+    Default: rstudio
+  DBMasterPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    Description: Master password (min 8 characters)
+
+Resources:
+  RdsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: RDS PostgreSQL - ingress managed by PCS stack
+      VpcId: !Ref VpcId
+      Tags:
+        - Key: Name
+          Value: rds-pcs-login-only
+
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Subnets for PCS RDS instance
+      SubnetIds:
+        - !Ref SubnetId1
+        - !Ref SubnetId2
+
+  RdsInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceIdentifier: !Sub "${AWS::StackName}-postgres"
+      Engine: postgres
+      EngineVersion: "18.4"
+      DBInstanceClass: db.t4g.micro
+      AllocatedStorage: 20
+      StorageType: gp3
+      DBName: !Ref DBName
+      MasterUsername: !Ref DBMasterUsername
+      MasterUserPassword: !Ref DBMasterPassword
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VPCSecurityGroups:
+        - !GetAtt RdsSecurityGroup.GroupId
+      PubliclyAccessible: false
+      MultiAZ: false
+      BackupRetentionPeriod: 1
+      DeletionProtection: false
+      StorageEncrypted: true
+      CopyTagsToSnapshot: true
+      Tags:
+        - Key: rs:project
+          Value: solutions
+        - Key: rs:environment
+          Value: development
+        - Key: rs:owner
+          Value: michael.mayer@posit.co
+    DeletionPolicy: Delete
+
+Outputs:
+  RdsEndpoint:
+    Value: !GetAtt RdsInstance.Endpoint.Address
+    Description: RDS endpoint hostname
+  RdsPort:
+    Value: !GetAtt RdsInstance.Endpoint.Port
+    Description: RDS port
+  RdsSecurityGroupId:
+    Value: !GetAtt RdsSecurityGroup.GroupId
+    Description: RDS security group ID
