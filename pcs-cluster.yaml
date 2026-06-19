@@ -530,6 +530,9 @@ Resources:
             # Install XFCE desktop environment
             apt-get install -y xfce4 xfce4-goodies dbus-x11
 
+            # Set XFCE as default session manager (GNOME crashes without GPU)
+            update-alternatives --set x-session-manager /usr/bin/xfce4-session
+
             # Install Amazon DCV
             wget https://d1uj6qtbmh3dt5.cloudfront.net/NICE-GPG-KEY
             gpg --import NICE-GPG-KEY
