@@ -2,20 +2,20 @@
 set -euo pipefail
 
 # Please fill in below
-export VPC_ID=
-export SUBNET_ID1=
-export SUBNET_ID2=
+export VPC_ID=vpc-
+export SUBNET_ID1=subnet-
+export SUBNET_ID2=subnet-
 
 export DB_PASSWORD=
 export AWS_REGION=
-export CERTIFICATE_ARN=
+export CERTIFICATE_ARN=arn:aws:acm:
+export STACK_NAME=
 export PWB_LICENSE=
 export PWB_VERSION=2026.05.1-225.pro10
 export PWB_VERSION_SHORT=2026.05.1
 
 export CONFIG_BUCKET=
 export CONFIG_PREFIX=config/rstudio
-
 # ---
 
 REGION="${AWS_REGION:-us-east-1}"
@@ -101,68 +101,7 @@ aws cloudformation deploy \
   --parameter-overrides $OVERRIDES \
   --region "$REGION"
 
-echo "PCS stack deployed. Fetching outputs..."
-PCS_SG_ID=$(aws cloudformation describe-stacks \
-  --stack-name "$STACK_NAME" \
-  --query 'Stacks[0].Outputs[?OutputKey==`SecurityGroupId`].OutputValue' \
-  --output text \
-  --region "$REGION")
-
-echo "PCS Security Group: ${PCS_SG_ID}"
-
-# --- Deploy NLB target registration Lambda (if NLB was created) ---
-
-if [ -n "${CERTIFICATE_ARN:-}" ]; then
-  NLB_STACK_NAME="${STACK_NAME}-lb"
-
-  PCS_CLUSTER_ID=$(aws cloudformation describe-stacks \
-    --stack-name "$STACK_NAME" \
-    --query 'Stacks[0].Outputs[?OutputKey==`ClusterId`].OutputValue' \
-    --output text \
-    --region "$REGION")
-
-  LOGIN_NODE_GROUP_ARN=$(aws cloudformation describe-stack-resources \
-    --stack-name "$STACK_NAME" \
-    --logical-resource-id LoginNodeGroup \
-    --query 'StackResources[0].PhysicalResourceId' \
-    --output text \
-    --region "$REGION")
-  LOGIN_NODE_GROUP_ID="${LOGIN_NODE_GROUP_ARN##*/}"
-
-  SSH_TG_ARN=$(aws cloudformation describe-stack-resources \
-    --stack-name "$STACK_NAME" \
-    --logical-resource-id SshTargetGroup \
-    --query 'StackResources[0].PhysicalResourceId' \
-    --output text \
-    --region "$REGION")
-
-  HTTPS_TG_ARN=$(aws cloudformation describe-stack-resources \
-    --stack-name "$STACK_NAME" \
-    --logical-resource-id HttpsTargetGroup \
-    --query 'StackResources[0].PhysicalResourceId' \
-    --output text \
-    --region "$REGION")
-
-  DCV_TG_ARN=$(aws cloudformation describe-stack-resources \
-    --stack-name "$STACK_NAME" \
-    --logical-resource-id DcvTargetGroup \
-    --query 'StackResources[0].PhysicalResourceId' \
-    --output text \
-    --region "$REGION")
-
-  echo "Deploying NLB registration Lambda: ${NLB_STACK_NAME}..."
-  aws cloudformation deploy \
-    --template-file "${SCRIPT_DIR}/nlb-register.yaml" \
-    --stack-name "$NLB_STACK_NAME" \
-    --capabilities CAPABILITY_NAMED_IAM \
-    --parameter-overrides \
-      PcsClusterId="${PCS_CLUSTER_ID}" \
-      LoginNodeGroupId="${LOGIN_NODE_GROUP_ID}" \
-      SshTargetGroupArn="${SSH_TG_ARN}" \
-      HttpsTargetGroupArn="${HTTPS_TG_ARN}" \
-      DcvTargetGroupArn="${DCV_TG_ARN}" \
-    --region "$REGION"
-fi
+echo "PCS stack deployed."
 
 echo ""
 echo "=== Deployment complete ==="

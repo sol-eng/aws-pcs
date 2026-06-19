@@ -9,14 +9,14 @@ AWS PCS (Parallel Computing Service) HPC environment deployed via CloudFormation
 ## Deployment
 
 ```bash
-# Full deploy (RDS + PCS + NLB Lambda)
+# Full deploy (RDS + PCS)
 ./run.sh
 ```
 
 Configuration is set via environment variables at the top of `run.sh`. Key variables:
 - `VPC_ID`, `SUBNET_ID1`, `SUBNET_ID2` — existing networking (both subnets must be in the same VPC, different AZs)
 - `SECURITY_GROUP_ID` — optional; one is created if omitted
-- `CERTIFICATE_ARN` — set to enable NLB with TLS termination (triggers NLB + Lambda registration stack)
+- `CERTIFICATE_ARN` — set to enable NLB with TLS termination and Lambda target registration
 - `DB_PASSWORD` — required for RDS stack
 - `AWS_REGION` — defaults to `us-east-1`; PCS supported in: us-east-1, us-east-2, us-west-2, eu-central-1, eu-west-1, ap-northeast-1
 - `STACK_NAME` — CloudFormation stack name prefix (used for all stacks and resource naming)
@@ -25,24 +25,23 @@ Configuration is set via environment variables at the top of `run.sh`. Key varia
 - `PWB_LICENSE` — Posit Workbench license key
 - `PWB_VERSION` / `PWB_VERSION_SHORT` — full and short PWB version strings
 
-Deployment order: RDS → PCS → NLB Lambda. The PCS stack adds the RDS security group ingress rule.
+Deployment order: RDS → PCS. The PCS stack adds the RDS security group ingress rule and (if NLB enabled) deploys Lambda for target registration.
 
-To delete stacks in reverse order: `<name>-lb` → `<name>` → `<name>-rds`.
+To delete stacks in reverse order: `<name>` → `<name>-rds`.
 
 ## Architecture
 
 ```
 run.sh  (orchestrator — deploys stacks sequentially, passes outputs between them)
   ├── rds.yaml           (RDS PostgreSQL, deploys first with empty SG)
-  ├── pcs-cluster.yaml   (main stack: VPC/SG/EFS/IAM/PCS cluster/node groups/queues/NLB, adds RDS SG ingress)
-  └── nlb-register.yaml  (Lambda + EventBridge — syncs login node IPs to NLB target groups)
+  └── pcs-cluster.yaml   (main stack: VPC/SG/EFS/IAM/PCS cluster/node groups/queues/NLB/Lambda, adds RDS SG ingress)
 ```
 
 **PCS Cluster (head node)**: Managed Slurm 25.11 controller (SMALL size: 32 nodes, 256 jobs max). No user access — AWS-managed.
 
 **Login nodes** (2x t3.large, static): Run Posit Workbench on port 8787 and Amazon DCV on port 8443. First node syncs config from S3, generates crypto keys (secure-cookie-key, launcher.pem/pub), creates `pwb_audit` DB, and builds squashfs image on EFS via lock-file patterns; second waits. UserData installs R, PWB, XFCE, DCV, postgresql-client, activates PWB license, provisions test users.
 
-**Compute nodes** (0–10 t3.large, dynamic): Scale with Slurm job demand. Mount squashfs from EFS at `/usr/lib/rstudio-server`. UserData installs R and provisions test users.
+**Compute nodes** (0–10 t3.xlarge, dynamic): Scale with Slurm job demand. Mount squashfs from EFS at `/usr/lib/rstudio-server`. UserData installs R and provisions test users.
 
 **EFS**: Single filesystem with two mount paths — `/home` (user dirs) and `/opt/shared` (shared software, squashfs images, config). Mounted on all nodes via NFS in UserData.
 
@@ -52,7 +51,7 @@ run.sh  (orchestrator — deploys stacks sequentially, passes outputs between th
 
 **DCV** (Amazon DCV): Installed on login nodes with XFCE desktop. Per-user virtual sessions (posit001–posit005) in software-rendering mode (no GPU). Users connect via DCV client or web browser on port 8443. Authentication uses system PAM.
 
-**Lambda** (nlb-register.yaml): Triggered by EC2 state-change events. Discovers login nodes by PCS tags (`aws:pcs:cluster-id`, `aws:pcs:compute-node-group-id`), syncs IPs with target groups (SSH:22, HTTPS:8787, DCV:8443). Also runs on initial deployment via Custom Resource.
+**Lambda** (conditional on `CertificateArn`, inside `pcs-cluster.yaml`): Triggered by EC2 state-change events. Discovers login nodes by PCS tags (`aws:pcs:cluster-id`, `aws:pcs:compute-node-group-id`), syncs IPs with target groups (SSH:22, HTTPS:8787, DCV:8443). Also runs on initial deployment via Custom Resource.
 
 **S3 Config**: Posit Workbench config files stored in S3, synced to `/opt/shared/rstudio/config/` on EFS by the first login node, then copied to `/etc/rstudio/` on all login nodes at boot. Database config (`database.conf`, `audit-database.conf`) is generated dynamically from RDS parameters.
 

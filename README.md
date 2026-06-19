@@ -14,7 +14,7 @@ An AWS Parallel Computing Service (PCS) cluster with Posit Workbench, Amazon DCV
                   |                                                         |
     +-------------+-------------+                         +----------------+----------------+
     |   Login Node Group (2x)   |                         |   Compute Node Group (0-10x)    |
-    |       t3.large            |                         |         t3.large                |
+    |       t3.large            |                         |         t3.xlarge               |
     |   - Posit Workbench :8787 |                         |   - R 4.6.0                     |
     |   - Amazon DCV :8443      |                         |   - Squashfs session mount      |
     |   - R 4.6.0               |                         |   - Fully dynamic (scales to 0) |
@@ -31,18 +31,16 @@ An AWS Parallel Computing Service (PCS) cluster with Posit Workbench, Amazon DCV
                               +---------------------------------+
 
     +------------------+          +------------------+          +------------------+
-    |   NLB (optional) |          |   RDS PostgreSQL |          |  NLB Register    |
-    |   :22  TCP->22   |          |   db.t4g.micro   |          |  Lambda          |
-    |   :443 TLS->8787 |          |   Port 5432      |          |  (EventBridge)   |
-    |   :8443 TCP->8443|          |   Encrypted      |          |                  |
-    |   Internal       |          |   pwb + pwb_audit|          |                  |
-    +------------------+          +------------------+          +------------------+
-
-    +------------------+
-    |   S3 Config      |
-    |   Bucket         |
-    |   (PWB configs)  |
-    +------------------+
+    |   NLB (optional) |          |   RDS PostgreSQL |          |  S3 Config       |
+    |   :22  TCP->22   |          |   db.t4g.micro   |          |  Bucket          |
+    |   :443 TLS->8787 |          |   Port 5432      |          |  (PWB configs)   |
+    |   :8443 TCP->8443|          |   Encrypted      |          +------------------+
+    |   Source IP      |          |   pwb + pwb_audit|
+    |    stickiness    |          |                  |          +------------------+
+    |   Internal       |          |                  |          |  Lambda + EB     |
+    +------------------+          +------------------+          |  (NLB target     |
+                                                                |   registration)  |
+                                                                +------------------+
 ```
 
 ## CloudFormation Stacks
@@ -52,8 +50,7 @@ Deployed in this order:
 | # | Stack | Template | Description |
 |---|-------|----------|-------------|
 | 1 | `<name>-rds` | `rds.yaml` | RDS PostgreSQL instance with empty SG (ingress added by PCS stack) |
-| 2 | `<name>` | `pcs-cluster.yaml` | Core infrastructure: VPC/SG (optional), EFS, IAM, PCS cluster, login & compute node groups, queues, NLB (optional), RDS SG ingress |
-| 3 | `<name>-lb` | `nlb-register.yaml` | Lambda + EventBridge rule to register login node IPs with NLB target groups |
+| 2 | `<name>` | `pcs-cluster.yaml` | Core infrastructure: VPC/SG (optional), EFS, IAM, PCS cluster, login & compute node groups, queues, NLB + Lambda target registration (optional), RDS SG ingress |
 
 ## Prerequisites
 
@@ -125,9 +122,7 @@ Instance identifier: `<stack-name>-postgres` (e.g., `michael-rds-postgres`).
 
 **NLB** (conditional on `CertificateArn`): Internal Network Load Balancer with TCP:22 passthrough, TLS:443 terminating to port 8787, and TCP:8443 passthrough for DCV. Source IP stickiness on all target groups ensures users always reach the same login node (required for DCV sessions which are node-local). HTTPS health check on port 8787 expects HTTP 302.
 
-### nlb-register.yaml
-
-Python 3.12 Lambda triggered by EC2 instance state-change events (running/stopped/terminated). Discovers login nodes by PCS tags and syncs their IPs with NLB target groups (SSH:22, HTTPS:8787, DCV:8443). Also runs once at deploy time via a CloudFormation Custom Resource.
+**Lambda target registration** (conditional on `CertificateArn`): Python 3.12 Lambda triggered by EC2 instance state-change events (running/stopped/terminated). Discovers login nodes by PCS tags and syncs their IPs with NLB target groups (SSH:22, HTTPS:8787, DCV:8443). Also runs once at deploy time via a CloudFormation Custom Resource.
 
 ### DCV Sessions
 
@@ -162,8 +157,6 @@ Five test users are provisioned on all nodes (login + compute):
 Delete stacks in reverse order:
 
 ```bash
-aws cloudformation delete-stack --stack-name <name>-lb --region <region>
-# Wait for above to complete, then:
 aws cloudformation delete-stack --stack-name <name> --region <region>
 # Wait for above to complete, then:
 aws cloudformation delete-stack --stack-name <name>-rds --region <region>

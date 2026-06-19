@@ -584,7 +584,7 @@ Resources:
     Properties:
       LaunchTemplateName: !Sub "${ClusterName}-compute-lt"
       LaunchTemplateData:
-        InstanceType: t3.large
+        InstanceType: t3.xlarge
         SecurityGroupIds:
           - !If [
               CreateSecurityGroup,
@@ -729,7 +729,7 @@ Resources:
         Version: !GetAtt ComputeLaunchTemplate.LatestVersionNumber
       IamInstanceProfileArn: !GetAtt PcsInstanceProfile.Arn
       InstanceConfigs:
-        - InstanceType: t3.large
+        - InstanceType: t3.xlarge
       ScalingConfiguration:
         MinInstanceCount: 0
         MaxInstanceCount: !Ref MaxComputeNodes
@@ -739,14 +739,6 @@ Resources:
       PurchaseOption: ONDEMAND
 
   # --- Queues ---
-
-  LoginQueue:
-    Type: AWS::PCS::Queue
-    Properties:
-      Name: login
-      ClusterId: !GetAtt PcsCluster.Id
-      ComputeNodeGroupConfigurations:
-        - ComputeNodeGroupId: !GetAtt LoginNodeGroup.Id
 
   ComputeQueue:
     Type: AWS::PCS::Queue
@@ -857,6 +849,173 @@ Resources:
       DefaultActions:
         - Type: forward
           TargetGroupArn: !Ref DcvTargetGroup
+
+  # --- NLB Target Registration Lambda (conditional) ---
+
+  RegisterLambdaRole:
+    Type: AWS::IAM::Role
+    Condition: CreateNlb
+    Properties:
+      RoleName: !Sub 'pcs-nlb-register-${PcsCluster.Id}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: RegisterTargets
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - elasticloadbalancing:DescribeTargetHealth
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - elasticloadbalancing:RegisterTargets
+                  - elasticloadbalancing:DeregisterTargets
+                Resource:
+                  - !Ref SshTargetGroup
+                  - !Ref HttpsTargetGroup
+                  - !Ref DcvTargetGroup
+
+  RegisterFunction:
+    Type: AWS::Lambda::Function
+    Condition: CreateNlb
+    Properties:
+      FunctionName: !Sub 'pcs-nlb-register-${PcsCluster.Id}'
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 60
+      Role: !GetAtt RegisterLambdaRole.Arn
+      Environment:
+        Variables:
+          SSH_TARGET_GROUP_ARN: !Ref SshTargetGroup
+          HTTPS_TARGET_GROUP_ARN: !Ref HttpsTargetGroup
+          DCV_TARGET_GROUP_ARN: !Ref DcvTargetGroup
+          PCS_CLUSTER_ID: !GetAtt PcsCluster.Id
+          LOGIN_NODE_GROUP_ID: !GetAtt LoginNodeGroup.Id
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          import cfnresponse
+
+          ec2 = boto3.client('ec2')
+          elbv2 = boto3.client('elbv2')
+
+          SSH_TG = os.environ['SSH_TARGET_GROUP_ARN']
+          HTTPS_TG = os.environ['HTTPS_TARGET_GROUP_ARN']
+          DCV_TG = os.environ.get('DCV_TARGET_GROUP_ARN', '')
+          CLUSTER_ID = os.environ['PCS_CLUSTER_ID']
+          NODE_GROUP_ID = os.environ['LOGIN_NODE_GROUP_ID']
+
+          def get_login_node_ips():
+              resp = ec2.describe_instances(Filters=[
+                  {'Name': 'tag:aws:pcs:cluster-id', 'Values': [CLUSTER_ID]},
+                  {'Name': 'tag:aws:pcs:compute-node-group-id', 'Values': [NODE_GROUP_ID]},
+                  {'Name': 'instance-state-name', 'Values': ['running']}
+              ])
+              ips = []
+              for res in resp['Reservations']:
+                  for inst in res['Instances']:
+                      if inst.get('PrivateIpAddress'):
+                          ips.append(inst['PrivateIpAddress'])
+              return ips
+
+          def sync_targets(tg_arn, ips, port):
+              current = elbv2.describe_target_health(TargetGroupArn=tg_arn)
+              current_ips = {t['Target']['Id'] for t in current['TargetHealthDescriptions']}
+              desired_ips = set(ips)
+
+              to_register = desired_ips - current_ips
+              to_deregister = current_ips - desired_ips
+
+              if to_deregister:
+                  elbv2.deregister_targets(
+                      TargetGroupArn=tg_arn,
+                      Targets=[{'Id': ip, 'Port': port} for ip in to_deregister]
+                  )
+              if to_register:
+                  elbv2.register_targets(
+                      TargetGroupArn=tg_arn,
+                      Targets=[{'Id': ip, 'Port': port} for ip in to_register]
+                  )
+              return {'registered': list(to_register), 'deregistered': list(to_deregister)}
+
+          def handler(event, context):
+              is_cfn = 'RequestType' in event
+              try:
+                  if is_cfn and event['RequestType'] == 'Delete':
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      return
+
+                  ips = get_login_node_ips()
+                  print(f"Found login node IPs: {ips}")
+
+                  ssh_result = sync_targets(SSH_TG, ips, 22)
+                  https_result = sync_targets(HTTPS_TG, ips, 8787)
+                  dcv_result = {}
+                  if DCV_TG:
+                      dcv_result = sync_targets(DCV_TG, ips, 8443)
+
+                  result = {'ssh': ssh_result, 'https': https_result, 'dcv': dcv_result, 'node_ips': ips}
+                  print(f"Sync result: {result}")
+
+                  if is_cfn:
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, result)
+                  return result
+              except Exception as e:
+                  print(f"Error: {e}")
+                  if is_cfn:
+                      cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+                  raise
+
+  InstanceStateRule:
+    Type: AWS::Events::Rule
+    Condition: CreateNlb
+    Properties:
+      Name: !Sub 'pcs-login-node-state-${PcsCluster.Id}'
+      Description: Trigger NLB registration when login node state changes
+      EventPattern:
+        source:
+          - aws.ec2
+        detail-type:
+          - EC2 Instance State-change Notification
+        detail:
+          state:
+            - running
+            - terminated
+            - stopped
+      State: ENABLED
+      Targets:
+        - Id: RegisterLambda
+          Arn: !GetAtt RegisterFunction.Arn
+
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Condition: CreateNlb
+    Properties:
+      FunctionName: !Ref RegisterFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt InstanceStateRule.Arn
+
+  InitialRegistration:
+    Type: Custom::RegisterTargets
+    Condition: CreateNlb
+    DependsOn: LambdaInvokePermission
+    Properties:
+      ServiceToken: !GetAtt RegisterFunction.Arn
 
 Outputs:
   ClusterId:

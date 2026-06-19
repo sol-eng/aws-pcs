@@ -29,7 +29,7 @@ Detailed architecture of the AWS PCS HPC environment including all CloudFormatio
 │  │  ┌─────────────────────┐                    │  │                    ┌─────────────────────┐  │   │
 │  │  │  Compute Nodes      │                    │  │                    │  Compute Nodes      │  │   │
 │  │  │  (0-5x dynamic)     │                    │  │                    │  (0-5x dynamic)     │  │   │
-│  │  │  t3.large           │                    │  │                    │  t3.large           │  │   │
+│  │  │  t3.xlarge          │                    │  │                    │  t3.xlarge          │  │   │
 │  │  └─────────────────────┘                    │  │                    └─────────────────────┘  │   │
 │  │                                             │  │                                             │   │
 │  │  ┌───────────────────────────────────────┐  │  │  ┌───────────────────────────────────────┐  │   │
@@ -58,7 +58,7 @@ Detailed architecture of the AWS PCS HPC environment including all CloudFormatio
 │                                                                                                      │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────┘
 
-External Services:
+External Services (conditional on CertificateArn — deployed within pcs-cluster.yaml):
 ┌──────────────────┐   ┌──────────────────┐   ┌──────────────────────────────────────────┐
 │  S3 Config       │   │  EventBridge     │   │  Lambda (pcs-nlb-register-<cluster-id>)  │
 │  Bucket          │   │  EC2 state-change│──▶│  Syncs login node IPs → NLB TGs          │
@@ -110,7 +110,7 @@ Core stack. Creates all compute infrastructure and optionally adds NLB + RDS con
 | `CreateVpc` | `ExistingVpcId` is empty | Creates VPC, IGW, route table |
 | `CreateSubnet` | `ExistingSubnetId1` is empty | Creates subnet in AZ 1 |
 | `CreateSecurityGroup` | `ExistingSecurityGroupId` is empty | Creates PCS security group |
-| `CreateNlb` | `CertificateArn` is set | Creates NLB, target groups, listeners, health check ingress |
+| `CreateNlb` | `CertificateArn` is set | Creates NLB, target groups, listeners, health check ingress, Lambda target registration |
 | `HasRds` | `RdsSecurityGroupId` is set | Creates port 5432 ingress on RDS SG |
 
 #### Resources
@@ -139,11 +139,10 @@ Core stack. Creates all compute infrastructure and optionally adds NLB + RDS con
 | `PcsNodeRole` | `AWS::IAM::Role` | — | EC2 + PCS + S3 permissions |
 | `PcsInstanceProfile` | `AWS::IAM::InstanceProfile` | — | Path: /aws-pcs/ |
 | `LoginLaunchTemplate` | `AWS::EC2::LaunchTemplate` | — | t3.large, UserData |
-| `ComputeLaunchTemplate` | `AWS::EC2::LaunchTemplate` | — | t3.large, UserData |
+| `ComputeLaunchTemplate` | `AWS::EC2::LaunchTemplate` | — | t3.xlarge, UserData |
 | `PcsCluster` | `AWS::PCS::Cluster` | — | Slurm 25.11, SMALL |
 | `LoginNodeGroup` | `AWS::PCS::ComputeNodeGroup` | — | 2x static, both subnets |
 | `ComputeNodeGroup` | `AWS::PCS::ComputeNodeGroup` | — | 0-10x dynamic |
-| `LoginQueue` | `AWS::PCS::Queue` | — | Slurm queue for login nodes |
 | `ComputeQueue` | `AWS::PCS::Queue` | — | Slurm queue for compute nodes |
 | `NetworkLoadBalancer` | `AWS::ElasticLoadBalancingV2::LoadBalancer` | CreateNlb | Internal NLB, both subnets |
 | `SshTargetGroup` | `AWS::ElasticLoadBalancingV2::TargetGroup` | CreateNlb | IP type, port 22, TCP health, source_ip sticky |
@@ -152,6 +151,11 @@ Core stack. Creates all compute infrastructure and optionally adds NLB + RDS con
 | `SshListener` | `AWS::ElasticLoadBalancingV2::Listener` | CreateNlb | :22 TCP passthrough |
 | `HttpsListener` | `AWS::ElasticLoadBalancingV2::Listener` | CreateNlb | :443 TLS → :8787 |
 | `DcvListener` | `AWS::ElasticLoadBalancingV2::Listener` | CreateNlb | :8443 TCP passthrough |
+| `RegisterLambdaRole` | `AWS::IAM::Role` | CreateNlb | ec2:DescribeInstances, ELB register/deregister |
+| `RegisterFunction` | `AWS::Lambda::Function` | CreateNlb | Python 3.12, 60s timeout, syncs IPs to TGs |
+| `InstanceStateRule` | `AWS::Events::Rule` | CreateNlb | EC2 state-change (running/stopped/terminated) |
+| `LambdaInvokePermission` | `AWS::Lambda::Permission` | CreateNlb | EventBridge → Lambda |
+| `InitialRegistration` | `Custom::RegisterTargets` | CreateNlb | Runs Lambda once at deploy time |
 
 #### Key Dependencies
 
@@ -159,39 +163,13 @@ Core stack. Creates all compute infrastructure and optionally adds NLB + RDS con
 - `LoginNodeGroup` / `ComputeNodeGroup` → implicitly depend on `PcsCluster`
 - `EfsMountTarget1/2` → must exist before nodes boot (UserData mounts EFS)
 
-#### Outputs (consumed by NLB Lambda stack)
+#### Outputs
 
 | Output | Usage |
 |--------|-------|
-| `ClusterId` | Lambda uses to filter EC2 instances by tag |
+| `ClusterId` | PCS Cluster ID |
 | `SecurityGroupId` | Reference |
-| `NlbDnsName` | User access endpoint |
-
----
-
-### Stack 3: `<name>-lb` (nlb-register.yaml)
-
-Deploys last. Registers login node IPs with NLB target groups and keeps them in sync.
-
-#### Resources
-
-| Resource | Type | Description |
-|----------|------|-------------|
-| `RegisterLambdaRole` | `AWS::IAM::Role` | ec2:DescribeInstances, ELB register/deregister |
-| `RegisterFunction` | `AWS::Lambda::Function` | Python 3.12, 60s timeout |
-| `InstanceStateRule` | `AWS::Events::Rule` | EC2 state-change (running/stopped/terminated) |
-| `LambdaInvokePermission` | `AWS::Lambda::Permission` | EventBridge → Lambda |
-| `InitialRegistration` | `Custom::RegisterTargets` | Runs Lambda once at deploy time |
-
-#### Parameters (all from PCS stack outputs / resources)
-
-| Parameter | Source |
-|-----------|--------|
-| `PcsClusterId` | PCS stack output `ClusterId` |
-| `LoginNodeGroupId` | Physical resource ID of `LoginNodeGroup` (short ID extracted from ARN) |
-| `SshTargetGroupArn` | Physical resource ID of `SshTargetGroup` |
-| `HttpsTargetGroupArn` | Physical resource ID of `HttpsTargetGroup` |
-| `DcvTargetGroupArn` | Physical resource ID of `DcvTargetGroup` |
+| `NlbDnsName` | User access endpoint (conditional) |
 
 ---
 
@@ -253,13 +231,13 @@ Compute Nodes
     ├──── :2049 (NFS) ──────→ EFS (/home, /opt/shared)
     └──── Slurm protocol ───→ PCS Cluster head node (job scheduling)
 
-Lambda (pcs-nlb-register)
+Lambda (pcs-nlb-register, conditional — part of pcs-cluster.yaml)
     │
     ├──── ec2:DescribeInstances ──→ Finds login nodes by PCS tags
     ├──── elbv2:RegisterTargets ──→ Adds IPs to SSH/HTTPS/DCV target groups
     └──── elbv2:DeregisterTargets → Removes stale IPs
 
-EventBridge
+EventBridge (conditional — part of pcs-cluster.yaml)
     │
     └──── EC2 state-change (running/stopped/terminated) ──→ Triggers Lambda
 ```
@@ -273,27 +251,28 @@ EventBridge
 │                           Deployment Order & Data Flow                                │
 └──────────────────────────────────────────────────────────────────────────────────────┘
 
-  ┌─────────────┐         ┌──────────────────────┐         ┌──────────────────┐
-  │  rds.yaml   │────────▶│   pcs-cluster.yaml   │────────▶│  nlb-register    │
-  │  (Stack 1)  │         │      (Stack 2)       │         │   (Stack 3)      │
-  └─────────────┘         └──────────────────────┘         └──────────────────┘
-        │                          │                              │
-        │                          │                              │
-   Outputs:                   Consumes from RDS:            Consumes from PCS:
-   • RdsEndpoint              • RdsSecurityGroupId          • ClusterId
-   • RdsSecurityGroupId       • RdsEndpoint                 • LoginNodeGroup ARN
-   • RdsPort                  • RdsPassword                 • SshTargetGroupArn
-                                                            • HttpsTargetGroupArn
-                              Creates:                      • DcvTargetGroupArn
-                              • RdsIngress (→ RDS SG)
-                              • All compute infra
-                              • NLB + target groups
+  ┌─────────────┐         ┌─────────────────────────────────────────────────────┐
+  │  rds.yaml   │────────▶│              pcs-cluster.yaml                       │
+  │  (Stack 1)  │         │              (Stack 2)                              │
+  └─────────────┘         └─────────────────────────────────────────────────────┘
+        │                          │
+        │                          │
+   Outputs:                   Consumes from RDS:
+   • RdsEndpoint              • RdsSecurityGroupId (adds port 5432 ingress)
+   • RdsSecurityGroupId       • RdsEndpoint (login node UserData)
+   • RdsPort                  • RdsPassword (login node UserData)
+                              
+                              Creates (unconditional):
+                              • EFS, IAM, PCS cluster, node groups, queues
+                              
+                              Creates (conditional on CertificateArn):
+                              • NLB + target groups + listeners
+                              • Lambda + EventBridge (target registration)
+                              • VPC CIDR health check ingress rules
 
   run.sh extracts:
   • RDS outputs via `describe-stacks`
   • VPC_CIDR via `describe-vpcs`
-  • LoginNodeGroupId via `describe-stack-resources` (ARN → short ID: ${ARN##*/})
-  • Target group ARNs via `describe-stack-resources`
 ```
 
 ---
@@ -386,7 +365,7 @@ EventBridge
 | `s3:ListBucket` | `arn:aws:s3:::<bucket>` | Bucket listing |
 | SSM Managed Policy | — | Systems Manager access |
 
-### Lambda Role (`pcs-nlb-register-<cluster-id>`)
+### Lambda Role (`pcs-nlb-register-<cluster-id>`, conditional on CreateNlb)
 
 | Permission | Resource | Purpose |
 |------------|----------|---------|
