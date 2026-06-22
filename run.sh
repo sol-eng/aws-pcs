@@ -16,7 +16,10 @@ export PWB_VERSION_SHORT=2026.05.1
 
 export CONFIG_BUCKET=
 export CONFIG_PREFIX=config/rstudio
+export SESSION_CALLBACK_ADDRESS="https://pcs.mycorp.net"
 # ---
+
+
 
 REGION="${AWS_REGION:-us-east-1}"
 STACK_NAME="${STACK_NAME:-hpc-cluster}"

@@ -348,6 +348,10 @@ Resources:
                 Resource:
                   - !Sub "arn:aws:s3:::${ConfigBucket}"
                   - !Sub "arn:aws:s3:::${ConfigBucket}/*"
+              - Effect: Allow
+                Action:
+                  - elasticloadbalancing:DescribeLoadBalancers
+                Resource: "*"
 
   PcsInstanceProfile:
     Type: AWS::IAM::InstanceProfile
@@ -396,7 +400,7 @@ Resources:
             exec > /var/log/pcs-login-init.log 2>&1
             echo "Login node bootstrap starting..."
 
-            # Make sure that cloud formation of EC2 bootup has run 
+            # Make sure that cloud formation of EC2 bootup has run
             echo "sleeping for 2 minutes for EC2 bootup cloud formation to finish..."
             sleep 120
             until apt-get -o DPkg::Lock::Timeout=300 update; do
@@ -499,7 +503,21 @@ Resources:
               cp -r /opt/shared/rstudio/config/* /etc/rstudio/ 2>/dev/null || true
               echo -e "provider=postgresql\nconnection-uri=postgresql://rstudio:${RdsPassword}@${RdsEndpoint}/pwb" > /etc/rstudio/database.conf
               echo -e "provider=postgresql\nconnection-uri=postgresql://rstudio:${RdsPassword}@${RdsEndpoint}/pwb_audit" > /etc/rstudio/audit-database.conf
-              
+              # Set launcher-sessions-callback-address to NLB DNS (retry until NLB is available)
+              SESSION_CALLBACK_ADDRESS=""
+              for attempt in $(seq 1 12); do
+                SESSION_CALLBACK_ADDRESS=$(aws elbv2 describe-load-balancers \
+                  --names "${ClusterName}-nlb" \
+                  --query 'LoadBalancers[0].DNSName' \
+                  --output text \
+                  --region ${AWS::Region} 2>/dev/null || echo "")
+                [ -n "$SESSION_CALLBACK_ADDRESS" ] && [ "$SESSION_CALLBACK_ADDRESS" != "None" ] && break
+                echo "Waiting for NLB (attempt $attempt/12)..."
+                sleep 30
+              done
+              if [ -n "$SESSION_CALLBACK_ADDRESS" ] && [ "$SESSION_CALLBACK_ADDRESS" != "None" ]; then
+                sed -i "s|launcher-sessions-callback-address=.*|launcher-sessions-callback-address=https://$SESSION_CALLBACK_ADDRESS|" /etc/rstudio/rserver.conf
+              fi
             fi
 
             # One-time squashfs build (first node only)
