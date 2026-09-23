@@ -82,6 +82,7 @@ run.sh  (orchestrator — deploys stacks sequentially, passes outputs between th
 - MIME multipart format required by PCS (Content-Type: multipart/mixed; boundary="==BOUNDARY==")
 - `rstudio-launcher` service uses a systemd drop-in override to source `/etc/profile.d/slurm.sh`
 - DCV config uses `printf '%s\n'` (not heredoc) to avoid indentation issues inside `!Sub |` blocks
+- Lock-file sections must release the lock via `trap ... EXIT` and give waiters a timeout that reclaims a stale lock — under `set -euo pipefail`, a build failure otherwise leaves the lock (e.g. `.squashfs-lock`) stuck on EFS forever, deadlocking every future boot of every node on that wait loop (symptom looks unrelated, e.g. "license activation never runs" because it's sequenced after the lock section)
 
 ## Tagging
 

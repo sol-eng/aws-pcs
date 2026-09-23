@@ -521,29 +521,52 @@ Resources:
             fi
 
             # One-time squashfs build (first node only)
-            if mkdir /opt/shared/.squashfs-lock 2>/dev/null; then
-              if [ ! -f /opt/shared/.squashfs-complete ]; then
-                echo "First node - building squashfs image..."
-                apt-get install -y squashfs-tools
-                SQSH_DIR=/opt/shared/rstudio/session-components
-                SQSH_FILE="${!SQSH_DIR}/rsw-session-${PwbVersion}.sqsh"
-                mkdir -p "${!SQSH_DIR}/downloads"
-                if [ ! -f "${!SQSH_FILE}" ]; then
-                  curl -Lo "${!SQSH_DIR}/downloads/rsp-session-jammy-${PwbVersion}-amd64.tar.gz" \
-                    "https://s3.amazonaws.com/rstudio-ide-build/session/jammy/amd64/rsp-session-jammy-${PwbVersion}-amd64.tar.gz"
-                  TMPDIR=$(mktemp -d)
-                  chmod 755 "$TMPDIR"
-                  tar xzf "${!SQSH_DIR}/downloads/rsp-session-jammy-${PwbVersion}-amd64.tar.gz" -C "$TMPDIR" --strip-components=1
-                  mksquashfs "$TMPDIR" "${!SQSH_FILE}" -comp zstd -noappend
-                  rm -rf "$TMPDIR"
+            # Lock release is idempotent everywhere (never fails under set -e even if another
+            # node already removed it) so a losing race can never kill the real builder mid-script.
+            # The image is built under a temp name and mv'd into place atomically, so a stale-lock
+            # reclaim that causes two nodes to build concurrently can never yield a half-written
+            # or corrupted image being mounted.
+            # Lock is reclaimed if held with no progress for SQUASHFS_WAIT_TIMEOUT seconds,
+            # so a node that dies mid-build (set -e) doesn't deadlock every future boot.
+            SQUASHFS_WAIT_TIMEOUT=1800
+            while true; do
+              if mkdir /opt/shared/.squashfs-lock 2>/dev/null; then
+                trap 'rmdir /opt/shared/.squashfs-lock 2>/dev/null || true' EXIT
+                if [ ! -f /opt/shared/.squashfs-complete ]; then
+                  echo "First node - building squashfs image..."
+                  apt-get install -y squashfs-tools
+                  SQSH_DIR=/opt/shared/rstudio/session-components
+                  SQSH_FILE="${!SQSH_DIR}/rsw-session-${PwbVersion}.sqsh"
+                  mkdir -p "${!SQSH_DIR}/downloads"
+                  if [ ! -f "${!SQSH_FILE}" ]; then
+                    curl -Lo "${!SQSH_DIR}/downloads/rsp-session-jammy-${PwbVersion}-amd64.tar.gz" \
+                      "https://s3.amazonaws.com/rstudio-ide-build/session/jammy/amd64/rsp-session-jammy-${PwbVersion}-amd64.tar.gz"
+                    TMPDIR=$(mktemp -d)
+                    chmod 755 "$TMPDIR"
+                    tar xzf "${!SQSH_DIR}/downloads/rsp-session-jammy-${PwbVersion}-amd64.tar.gz" -C "$TMPDIR" --strip-components=1
+                    mksquashfs "$TMPDIR" "${!SQSH_FILE}.tmp" -comp zstd -noappend
+                    mv -f "${!SQSH_FILE}.tmp" "${!SQSH_FILE}"
+                    rm -rf "$TMPDIR"
+                  fi
+                  touch /opt/shared/.squashfs-complete
                 fi
-                touch /opt/shared/.squashfs-complete
+                rmdir /opt/shared/.squashfs-lock 2>/dev/null || true
+                trap - EXIT
+                break
+              else
+                echo "Another node is building squashfs, waiting..."
+                WAITED=0
+                while [ ! -f /opt/shared/.squashfs-complete ] && [ -d /opt/shared/.squashfs-lock ] && [ "$WAITED" -lt "$SQUASHFS_WAIT_TIMEOUT" ]; do
+                  sleep 5
+                  WAITED=$((WAITED + 5))
+                done
+                if [ -f /opt/shared/.squashfs-complete ]; then
+                  break
+                fi
+                echo "Squashfs lock stale after ${!SQUASHFS_WAIT_TIMEOUT}s with no completion; reclaiming..."
+                rmdir /opt/shared/.squashfs-lock 2>/dev/null || true
               fi
-              rmdir /opt/shared/.squashfs-lock
-            else
-              echo "Another node is building squashfs, waiting..."
-              while [ ! -f /opt/shared/.squashfs-complete ]; do sleep 5; done
-            fi
+            done
 
             # Install XFCE desktop environment
             apt-get install -y xfce4 xfce4-goodies dbus-x11
