@@ -11,15 +11,29 @@ export AWS_REGION=
 export CERTIFICATE_ARN=arn:aws:acm:
 export STACK_NAME=
 export PWB_LICENSE=
-export PWB_VERSION=2026.05.1-225.pro10
-export PWB_VERSION_SHORT=2026.05.1
+export PWB_VERSION=2026.09.0-174.pro3
+export PWB_VERSION_SHORT=2026.09.0
 
 export CONFIG_BUCKET=
 export CONFIG_PREFIX=config/rstudio
-export SESSION_CALLBACK_ADDRESS="https://pcs.mycorp.net"
+export SESSION_CALLBACK_ADDRESS="https://workbench.pcluster.soleng.posit.it"
 # ---
 
+export VPC_ID=vpc-02c67d4d1c8fb03b0
+export SUBNET_ID1=subnet-055971c5dfcef6442
+export SUBNET_ID2=subnet-00f276a6051834ff2
 
+export DB_PASSWORD=Testme1234
+export AWS_REGION=eu-west-1
+export CERTIFICATE_ARN=arn:aws:acm:eu-west-1:637485797898:certificate/aee6d101-3558-45a1-a3c5-69663452475f
+export STACK_NAME="michael98"
+export PWB_LICENSE=KAZG-PPFB-HH8S-SE8A-CP9J-F7GW-YWTA
+export PWB_VERSION=2026.09.0-174.pro3
+export PWB_VERSION_SHORT=2026.09.0
+
+export CONFIG_BUCKET=hpc-scripts1234
+export CONFIG_PREFIX=config/rstudio
+export SESSION_CALLBACK_ADDRESS="https://pcs.pcluster.soleng.posit.it"
 
 REGION="${AWS_REGION:-us-east-1}"
 STACK_NAME="${STACK_NAME:-hpc-cluster}"
@@ -95,6 +109,7 @@ OVERRIDES="${OVERRIDES} VpcCidr=${VPC_CIDR}"
 [ -n "${PWB_LICENSE:-}" ] && OVERRIDES="${OVERRIDES} PwbLicense=${PWB_LICENSE}"
 [ -n "${PWB_VERSION:-}" ] && OVERRIDES="${OVERRIDES} PwbVersion=${PWB_VERSION}"
 [ -n "${PWB_VERSION_SHORT:-}" ] && OVERRIDES="${OVERRIDES} PwbVersionShort=${PWB_VERSION_SHORT}"
+[ -n "${MAX_GPU_NODES:-}" ] && OVERRIDES="${OVERRIDES} MaxGpuNodes=${MAX_GPU_NODES}"
 
 echo "Deploying PCS stack: ${STACK_NAME}..."
 aws cloudformation deploy \

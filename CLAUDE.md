@@ -24,6 +24,7 @@ Configuration is set via environment variables at the top of `run.sh`. Key varia
 - `CONFIG_PREFIX` — S3 key prefix within the bucket (default: `config/rstudio`)
 - `PWB_LICENSE` — Posit Workbench license key
 - `PWB_VERSION` / `PWB_VERSION_SHORT` — full and short PWB version strings
+- `MAX_GPU_NODES` — optional; max GPU nodes in the `gpu` queue (default 2)
 
 Deployment order: RDS → PCS. The PCS stack adds the RDS security group ingress rule and (if NLB enabled) deploys Lambda for target registration.
 
@@ -37,11 +38,13 @@ run.sh  (orchestrator — deploys stacks sequentially, passes outputs between th
   └── pcs-cluster.yaml   (main stack: VPC/SG/EFS/IAM/PCS cluster/node groups/queues/NLB/Lambda, adds RDS SG ingress)
 ```
 
-**PCS Cluster (head node)**: Managed Slurm 25.11 controller (SMALL size: 32 nodes, 256 jobs max). No user access — AWS-managed.
+**PCS Cluster (head node)**: Managed Slurm 25.11 controller (SMALL size: 32 nodes, 256 jobs max). No user access — AWS-managed. Slurm settings via `SlurmConfiguration`: `SelectTypeParameters=CR_CPU_Memory` (CPU + memory consumable), `DefMemPerCPU=3700`, Slurm accounting `Mode: STANDARD` (PCS-managed DB, retention via `AccountingPurgeDays` param, default 90; no `AccountingStorageEnforce`). `compute` queue is the default partition (`Default=YES`). `CliFilterPlugins=cli_filter/lua` + `CliFilterParameters=cli_filter_lua_path=/opt/shared/slurm/cli_filter.lua`: client-side Lua filter that sets `partition=gpu` for any job requesting >0 GPUs (`--gres=gpu…`, `--gpus*`, `--tres-per-task`); skipped inside allocations (`SLURM_JOB_ID` set). Compute node group sets `RealMemory=14800`.
+
+**GPU nodes** (0–`MaxGpuNodes` g4dn.xlarge, default max 2, dynamic; 1x NVIDIA T4, 2 Slurm CPUs with SMT disabled, 16 GiB, `RealMemory=14800`): `gpu` queue (not default), node group `gpu-nodes-g4dn`, own launch template `GpuLaunchTemplate`. UserData = compute UserData + OpenCL ICD loader/`clinfo`, `/etc/OpenCL/vendors/nvidia.icd`, `/etc/profile.d/cuda.sh`; log `/var/log/pcs-gpu-init.log`. NVIDIA driver and CUDA come from the DLAMI base AMI. GPU GRES is PCS's default (untyped), so request with `--gres=gpu:1`. Workbench exposes it via `enable-gpus=1` (no `gpu-types`) and a `[gpu]` resource profile with `partition=gpu`.
 
 **Login nodes** (2x t3.large, static): Run Posit Workbench on port 8787 and Amazon DCV on port 8443. First node syncs config from S3, generates crypto keys (secure-cookie-key, launcher.pem/pub), creates `pwb_audit` DB, and builds squashfs image on EFS via lock-file patterns; second waits. UserData installs R, PWB, XFCE, DCV, postgresql-client, activates PWB license, provisions test users.
 
-**Compute nodes** (0–10 t3.xlarge, dynamic): Scale with Slurm job demand. Mount squashfs from EFS at `/usr/lib/rstudio-server`. UserData installs R and provisions test users.
+**Compute nodes** (0–10 m7a.xlarge, dynamic; 4 physical cores, no SMT): Scale with Slurm job demand. Mount squashfs from EFS at `/usr/lib/rstudio-server`. UserData installs R and provisions test users.
 
 **EFS**: Single filesystem with two mount paths — `/home` (user dirs) and `/opt/shared` (shared software, squashfs images, config). Mounted on all nodes via NFS in UserData.
 
@@ -66,12 +69,16 @@ run.sh  (orchestrator — deploys stacks sequentially, passes outputs between th
 - PCS node role needs `ec2:RunInstances` and related EC2 permissions beyond just `pcs:RegisterComputeNodeGroupInstance`
 - `aws pcs` CLI subcommand may not be available — use CloudFormation resource lookups instead
 - `elasticloadbalancing:DescribeTargetHealth` does not support resource-level permissions — must use `Resource: '*'`
+- PCS disables SMT on all compute nodes at bootstrap (not configurable) — Slurm CPUs = physical cores (e.g. t3.xlarge = 2 CPUs, not 4 vCPUs), so pick instance types by physical core count. `RealMemory` (compute node group) and `DefMemPerCPU` (cluster) are tied to m7a.xlarge — update both if the compute instance type changes; RealMemory above actual MemTotal drains nodes. Changing `InstanceConfigs` replaces the node group, so also change its `Name` to avoid a name collision
+- GPU instance availability differs per region/AZ (e.g. g6.xlarge isn't offered in eu-west-1; g4dn.xlarge is in 1a/1b/1c). Check `describe-instance-type-offerings` against both subnets' AZs before changing the GPU type. As with compute, changing `InstanceConfigs` requires renaming the node group
+- `JobSubmitPlugins` is NOT allow-listed (managed controller) — use `CliFilterPlugins=cli_filter/lua` instead. The Lua file must exist on every node or all `sbatch`/`srun`/`salloc` fail; it lives on EFS (`/opt/shared/slurm/cli_filter.lua`), written atomically by each login node at boot from an inline heredoc in `LoginLaunchTemplate` UserData (single source of truth)
+- PCS custom Slurm settings are allow-listed per level (cluster / node group / queue) — check AWS PCS docs before adding new ones
 - NLB health checks originate from NLB ENI IPs (within VPC CIDR), NOT from the PCS security group — need separate VpcCidr ingress rules
 
 ## UserData Conventions
 
 - Use `${!VAR}` to escape bash variables from CloudFormation `!Sub` interpolation
-- Bootstrap logs go to `/var/log/pcs-login-init.log` and `/var/log/pcs-compute-init.log`
+- Bootstrap logs go to `/var/log/pcs-login-init.log`, `/var/log/pcs-compute-init.log` and `/var/log/pcs-gpu-init.log`
 - 2-minute sleep at start to allow PCS agent / cloud-init to finish
 - `apt-get update` wrapped in `until` retry loop (handles apt lists lock contention from cloud-init/PCS agent)
 - `-o DPkg::Lock::Timeout=300` on `apt-get update` covers dpkg lock; `until` loop covers apt lists lock
@@ -81,6 +88,9 @@ run.sh  (orchestrator — deploys stacks sequentially, passes outputs between th
 - AMI is Ubuntu 24.04 based (`aws-pcs-ready-dlami-base-ubuntu2404-x86_64`), UserData uses `apt-get`
 - MIME multipart format required by PCS (Content-Type: multipart/mixed; boundary="==BOUNDARY==")
 - `rstudio-launcher` service uses a systemd drop-in override to source `/etc/profile.d/slurm.sh`
+- `database.conf` must set `pool-size=8` explicitly. The default pool size is derived from the CPU count, and with SMT disabled a t3.large login node has 1 CPU → pool of 1 → rserver deadlocks waiting for a second connection (`DB connection held for 15003ms`, `Could not query starting sessions for orphan tracking`), gets a null connection and segfaults (`ASSERTION FAILED: px != 0`, dmesg `segfault at 0`) every ~38s. Symptom: NLB 502, 8787 targets unhealthy, SSH/DCV healthy. It can work for hours and then flip into the crash loop
+- Login nodes prune stale Workbench nodes at boot (`rstudio-server list-nodes`/`delete-node`, keeping only IPs of live instances in the login node group via `ec2:DescribeInstances`). Replaced login nodes otherwise stay registered in the shared `pwb` DB as `Missed check-in`. `rstudio-server delete-node` can hang on a dead node (it calls `/stop-node` on it); fallback is `DELETE FROM node WHERE id='<id>'` (id is a text column)
+- Replacing the compute node group kills running sessions; their `active_session_metadata` rows can get stuck in `shutting_down`/`running`
 - DCV config uses `printf '%s\n'` (not heredoc) to avoid indentation issues inside `!Sub |` blocks
 - Lock-file sections must release the lock via `trap ... EXIT` and give waiters a timeout that reclaims a stale lock — under `set -euo pipefail`, a build failure otherwise leaves the lock (e.g. `.squashfs-lock`) stuck on EFS forever, deadlocking every future boot of every node on that wait loop (symptom looks unrelated, e.g. "license activation never runs" because it's sequenced after the lock section)
 

@@ -10,6 +10,14 @@ Parameters:
     Type: Number
     Default: 10
     Description: Maximum number of dynamic compute nodes
+  MaxGpuNodes:
+    Type: Number
+    Default: 2
+    Description: Maximum number of dynamic GPU nodes (g4dn.xlarge, 1x NVIDIA T4)
+  AccountingPurgeDays:
+    Type: Number
+    Default: 90
+    Description: Retention (days) for Slurm accounting records (-1 = keep forever)
   AmiId:
     Type: AWS::EC2::Image::Id
     Description: PCS-ready AMI ID (find via aws ec2 describe-images --owners amazon --filters "Name=name,Values=aws-pcs-ready-dlami-base-ubuntu2404*")
@@ -430,6 +438,50 @@ Resources:
             echo "$EFS_DNS:/home /home nfs4 nfsvers=4.1,rsize=1048576,wsize=1048576,hard,timeo=600,retrans=2,_netdev 0 0" >> /etc/fstab
             echo "$EFS_DNS:/opt-shared /opt/shared nfs4 nfsvers=4.1,rsize=1048576,wsize=1048576,hard,timeo=600,retrans=2,_netdev 0 0" >> /etc/fstab
 
+            # Slurm CLI filter (CliFilterPlugins=cli_filter/lua): route GPU jobs to the gpu queue.
+            # PCS doesn't allow JobSubmitPlugins (managed controller), so this runs client-side on
+            # every node via CliFilterParameters=cli_filter_lua_path on EFS. Every sbatch/srun/salloc
+            # fails if the file is missing, so write it atomically on each login node boot.
+            mkdir -p /opt/shared/slurm
+            cat > /opt/shared/slurm/cli_filter.lua.tmp.$$ <<'EOF'
+            -- Route jobs that request a non-zero number of GPUs to the "gpu" partition
+            -- (--gres=gpu[:type]:N, --gpus/-G, --gpus-per-node/-task/-socket, --tres-per-task)
+
+            local function requests_gpu(value, need_gpu_name)
+              if value == nil or value == "" then return false end
+              for item in string.gmatch(value, "[^,]+") do
+                if not need_gpu_name or string.find(item, "gpu", 1, true) then
+                  local n = string.match(item, "[:=](%d+)$") or string.match(item, "^(%d+)$")
+                  if n == nil or tonumber(n) > 0 then return true end
+                end
+              end
+              return false
+            end
+
+            function slurm_cli_setup_defaults(options, early_pass)
+              return slurm.SUCCESS
+            end
+
+            function slurm_cli_pre_submit(options, pack_offset)
+              -- Leave job steps (srun inside an allocation) alone
+              if os.getenv("SLURM_JOB_ID") ~= nil then return slurm.SUCCESS end
+              if requests_gpu(options["gres"], true)
+                or requests_gpu(options["tres-per-task"], true)
+                or requests_gpu(options["gpus"], false)
+                or requests_gpu(options["gpus-per-node"], false)
+                or requests_gpu(options["gpus-per-task"], false)
+                or requests_gpu(options["gpus-per-socket"], false) then
+                options["partition"] = "gpu"
+              end
+              return slurm.SUCCESS
+            end
+
+            function slurm_cli_post_submit(offset, job_id, step_id)
+              return slurm.SUCCESS
+            end
+            EOF
+            mv -f /opt/shared/slurm/cli_filter.lua.tmp.$$ /opt/shared/slurm/cli_filter.lua
+
             # Install R
             R_VERSION=4.6.0
             curl -Lo /tmp/r-${!R_VERSION}_1_amd64.deb \
@@ -501,7 +553,10 @@ Resources:
             # Deploy shared config files from EFS
             if [ -d /opt/shared/rstudio/config ]; then
               cp -r /opt/shared/rstudio/config/* /etc/rstudio/ 2>/dev/null || true
-              echo -e "provider=postgresql\nconnection-uri=postgresql://rstudio:${RdsPassword}@${RdsEndpoint}/pwb" > /etc/rstudio/database.conf
+              # Explicit pool-size: the default is derived from the CPU count, and PCS disables SMT,
+              # so t3.large login nodes have 1 CPU -> pool of 1 -> startup deadlocks on a second
+              # connection (3x5s timeouts) and rserver segfaults on the null connection, in a loop.
+              echo -e "provider=postgresql\nconnection-uri=postgresql://rstudio:${RdsPassword}@${RdsEndpoint}/pwb\npool-size=8" > /etc/rstudio/database.conf
               echo -e "provider=postgresql\nconnection-uri=postgresql://rstudio:${RdsPassword}@${RdsEndpoint}/pwb_audit" > /etc/rstudio/audit-database.conf
               # Set launcher-sessions-callback-address to NLB DNS (retry until NLB is available)
               SESSION_CALLBACK_ADDRESS=""
@@ -618,7 +673,29 @@ Resources:
             rstudio-launcher stop 
             rm -rf /var/log/rstudio/*/*
             rstudio-launcher start
-            rstudio-server start 
+            rstudio-server start
+
+            # Remove stale Workbench nodes: replaced login nodes keep their entry in the shared DB,
+            # and rserver keeps contacting them (connection timeouts -> DB pool timeouts -> segfault loop).
+            # Keep only the IPs of live instances in this login node group. Non-fatal.
+            (
+              TOKEN=$(curl -sX PUT http://169.254.169.254/latest/api/token -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
+              INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
+              NODE_GROUP_ID=$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" --region ${AWS::Region} \
+                --query 'Reservations[0].Instances[0].Tags[?Key==`aws:pcs:compute-node-group-id`].Value' --output text)
+              LOGIN_IPS=$(aws ec2 describe-instances --region ${AWS::Region} \
+                --filters "Name=tag:aws:pcs:compute-node-group-id,Values=$NODE_GROUP_ID" "Name=instance-state-name,Values=pending,running" \
+                --query 'Reservations[].Instances[].PrivateIpAddress' --output text)
+              if [ -n "$NODE_GROUP_ID" ] && [ "$NODE_GROUP_ID" != "None" ] && [ -n "$LOGIN_IPS" ]; then
+                rstudio-server list-nodes | awk '$1 ~ /^[0-9]+$/ {print $1, $3}' | while read -r NODE_ID NODE_IP; do
+                  if ! grep -qwF "$NODE_IP" <<< "$LOGIN_IPS"; then
+                    echo "Deleting stale Workbench node $NODE_ID ($NODE_IP)"
+                    # delete-node can hang calling /stop-node on the dead host
+                    timeout 60 rstudio-server delete-node "$NODE_ID" || echo "delete-node $NODE_ID timed out/failed"
+                  fi
+                done
+              fi
+            ) || echo "Stale Workbench node cleanup failed (non-fatal)"
 
             echo "Login node bootstrap complete."
             --==BOUNDARY==--
@@ -628,7 +705,7 @@ Resources:
     Properties:
       LaunchTemplateName: !Sub "${ClusterName}-compute-lt"
       LaunchTemplateData:
-        InstanceType: t3.xlarge
+        InstanceType: m7a.xlarge
         SecurityGroupIds:
           - !If [
               CreateSecurityGroup,
@@ -713,8 +790,114 @@ Resources:
             echo "${!SQSH_FILE} /usr/lib/rstudio-server squashfs ro,loop,threads=multi,_netdev 0 0" >> /etc/fstab
 
             # Make sure system dependencies for session components are there 
-            apt-get install -y curl libcurl4-gnutls-dev libssl-dev libpq5 rrdtool
+            apt-get install -y curl libcurl4-gnutls-dev libssl-dev libpq5 rrdtool libxml2-dev
             echo "Compute node bootstrap complete."
+            --==BOUNDARY==--
+
+  GpuLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub "${ClusterName}-gpu-lt"
+      LaunchTemplateData:
+        InstanceType: g4dn.xlarge
+        SecurityGroupIds:
+          - !If [
+              CreateSecurityGroup,
+              !GetAtt ClusterSecurityGroup.GroupId,
+              !Ref ExistingSecurityGroupId,
+            ]
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: rs:project
+                Value: solutions
+              - Key: rs:environment
+                Value: development
+              - Key: rs:owner
+                Value: michael.mayer@posit.co
+              - Key: Name
+                Value: !Sub "${ClusterName}-gpu"
+        UserData:
+          Fn::Base64: !Sub |
+            Content-Type: multipart/mixed; boundary="==BOUNDARY=="
+            MIME-Version: 1.0
+
+            --==BOUNDARY==
+            Content-Type: text/x-shellscript; charset="us-ascii"
+            MIME-Version: 1.0
+
+            #!/bin/bash
+            set -euo pipefail
+            exec > /var/log/pcs-gpu-init.log 2>&1
+            echo "GPU node bootstrap starting..."
+
+            # Make sure that cloud formation of EC2 bootup has run 
+            echo "sleeping for 2 minutes for EC2 bootup cloud formation to finish..."
+            sleep 120
+            until apt-get -o DPkg::Lock::Timeout=300 update; do
+              echo "apt-get update failed, retrying in 10s..."
+              sleep 10
+            done
+
+            # Mount shared EFS
+            apt-get install -y nfs-common amazon-efs-utils
+            EFS_DNS=${SharedFileSystem}.efs.${AWS::Region}.amazonaws.com
+
+            # Mount root to ensure subdirectories exist
+            mkdir -p /mnt/efs
+            mount -t nfs4 -o nfsvers=4.1,rsize=1048576,wsize=1048576,hard,timeo=600,retrans=2 \
+              $EFS_DNS:/ /mnt/efs
+            mkdir -p /mnt/efs/home /mnt/efs/opt-shared
+            umount /mnt/efs
+
+            # Mount subdirectories
+            mkdir -p /home /opt/shared
+            mount -t nfs4 -o nfsvers=4.1,rsize=1048576,wsize=1048576,hard,timeo=600,retrans=2 \
+              $EFS_DNS:/home /home
+            mount -t nfs4 -o nfsvers=4.1,rsize=1048576,wsize=1048576,hard,timeo=600,retrans=2 \
+              $EFS_DNS:/opt-shared /opt/shared
+
+            # Persist mounts across reboots
+            echo "$EFS_DNS:/home /home nfs4 nfsvers=4.1,rsize=1048576,wsize=1048576,hard,timeo=600,retrans=2,_netdev 0 0" >> /etc/fstab
+            echo "$EFS_DNS:/opt-shared /opt/shared nfs4 nfsvers=4.1,rsize=1048576,wsize=1048576,hard,timeo=600,retrans=2,_netdev 0 0" >> /etc/fstab
+
+            # Install R
+            R_VERSION=4.6.0
+            curl -Lo /tmp/r-${!R_VERSION}_1_amd64.deb \
+              https://cdn.posit.co/r/ubuntu-2404/pkgs/r-${!R_VERSION}_1_amd64.deb
+            apt-get install -y /tmp/r-${!R_VERSION}_1_amd64.deb
+
+            # Provision test users
+            for i in $(seq -w 1 5); do
+              USER="posit0${!i}"
+              id "$USER" &>/dev/null || useradd -m -u "200${!i}" -s /bin/bash "$USER"
+              echo "$USER:rstudio" | chpasswd
+            done
+
+            # Mount squashfs session components from shared EFS
+            SQSH_FILE=/opt/shared/rstudio/session-components/rsw-session-${PwbVersion}.sqsh
+            echo "Waiting for squashfs image..."
+            while [ ! -f "${!SQSH_FILE}" ]; do sleep 5; done
+            rm -rf /usr/lib/rstudio-server
+            mkdir -p /usr/lib/rstudio-server
+            mount -t squashfs -o ro,loop,threads=multi "${!SQSH_FILE}" /usr/lib/rstudio-server
+            echo "${!SQSH_FILE} /usr/lib/rstudio-server squashfs ro,loop,threads=multi,_netdev 0 0" >> /etc/fstab
+
+            # Make sure system dependencies for session components are there 
+            apt-get install -y curl libcurl4-gnutls-dev libssl-dev libpq5 rrdtool libxml2-dev
+
+            # GPU: NVIDIA driver and CUDA toolkit come with the DLAMI base AMI;
+            # add the OpenCL ICD loader and register the NVIDIA vendor ICD
+            apt-get install -y ocl-icd-libopencl1 clinfo
+            mkdir -p /etc/OpenCL/vendors
+            [ -f /etc/OpenCL/vendors/nvidia.icd ] || echo "libnvidia-opencl.so.1" > /etc/OpenCL/vendors/nvidia.icd
+            # Put CUDA on PATH for all users (login shells / Workbench sessions)
+            printf '%s\n' \
+              'export PATH=/usr/local/cuda/bin:$PATH' \
+              'export LD_LIBRARY_PATH=/usr/local/cuda/lib64${!LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}' \
+              > /etc/profile.d/cuda.sh
+            nvidia-smi || echo "WARNING: nvidia-smi failed"
+            echo "GPU node bootstrap complete."
             --==BOUNDARY==--
 
   # --- PCS Cluster (Head Node) ---
@@ -728,6 +911,22 @@ Resources:
       Scheduler:
         Type: SLURM
         Version: "25.11"
+      SlurmConfiguration:
+        Accounting:
+          Mode: STANDARD
+          DefaultPurgeTimeInDays: !Ref AccountingPurgeDays
+        SlurmCustomSettings:
+          # Schedule CPU and memory as consumable resources
+          - ParameterName: SelectTypeParameters
+            ParameterValue: CR_CPU_Memory
+          # Default memory (MiB) per CPU for jobs without --mem (RealMemory / 4 cores on m7a.xlarge)
+          - ParameterName: DefMemPerCPU
+            ParameterValue: "3700"
+          # Client-side Lua filter routing GPU jobs to the gpu queue (written to EFS by login nodes)
+          - ParameterName: CliFilterPlugins
+            ParameterValue: cli_filter/lua
+          - ParameterName: CliFilterParameters
+            ParameterValue: cli_filter_lua_path=/opt/shared/slurm/cli_filter.lua
       Networking:
         SubnetIds:
           - !If [CreateSubnet, !Ref Subnet, !Ref ExistingSubnetId1]
@@ -765,7 +964,7 @@ Resources:
   ComputeNodeGroup:
     Type: AWS::PCS::ComputeNodeGroup
     Properties:
-      Name: compute-nodes
+      Name: compute-nodes-m7a
       ClusterId: !GetAtt PcsCluster.Id
       AmiId: !Ref AmiId
       CustomLaunchTemplate:
@@ -773,7 +972,7 @@ Resources:
         Version: !GetAtt ComputeLaunchTemplate.LatestVersionNumber
       IamInstanceProfileArn: !GetAtt PcsInstanceProfile.Arn
       InstanceConfigs:
-        - InstanceType: t3.xlarge
+        - InstanceType: m7a.xlarge
       ScalingConfiguration:
         MinInstanceCount: 0
         MaxInstanceCount: !Ref MaxComputeNodes
@@ -781,6 +980,40 @@ Resources:
         - !If [CreateSubnet, !Ref Subnet, !Ref ExistingSubnetId1]
         - !Ref ExistingSubnetId2
       PurchaseOption: ONDEMAND
+      SlurmConfiguration:
+        SlurmCustomSettings:
+          # Schedulable memory (MiB) — tied to m7a.xlarge (16 GiB); must stay below
+          # actual MemTotal or nodes drain. Update with DefMemPerCPU if instance type changes.
+          - ParameterName: RealMemory
+            ParameterValue: "14800"
+
+  # --- GPU Node Group (fully dynamic, 1x NVIDIA T4 per node) ---
+
+  GpuNodeGroup:
+    Type: AWS::PCS::ComputeNodeGroup
+    Properties:
+      Name: gpu-nodes-g4dn
+      ClusterId: !GetAtt PcsCluster.Id
+      AmiId: !Ref AmiId
+      CustomLaunchTemplate:
+        TemplateId: !Ref GpuLaunchTemplate
+        Version: !GetAtt GpuLaunchTemplate.LatestVersionNumber
+      IamInstanceProfileArn: !GetAtt PcsInstanceProfile.Arn
+      InstanceConfigs:
+        - InstanceType: g4dn.xlarge
+      ScalingConfiguration:
+        MinInstanceCount: 0
+        MaxInstanceCount: !Ref MaxGpuNodes
+      SubnetIds:
+        - !If [CreateSubnet, !Ref Subnet, !Ref ExistingSubnetId1]
+        - !Ref ExistingSubnetId2
+      PurchaseOption: ONDEMAND
+      SlurmConfiguration:
+        SlurmCustomSettings:
+          # Schedulable memory (MiB) — g4dn.xlarge also has 16 GiB; must stay below
+          # actual MemTotal or nodes drain. GPU GRES is generated by PCS.
+          - ParameterName: RealMemory
+            ParameterValue: "14800"
 
   # --- Queues ---
 
@@ -791,6 +1024,18 @@ Resources:
       ClusterId: !GetAtt PcsCluster.Id
       ComputeNodeGroupConfigurations:
         - ComputeNodeGroupId: !GetAtt ComputeNodeGroup.Id
+      SlurmConfiguration:
+        SlurmCustomSettings:
+          - ParameterName: Default
+            ParameterValue: "YES"
+
+  GpuQueue:
+    Type: AWS::PCS::Queue
+    Properties:
+      Name: gpu
+      ClusterId: !GetAtt PcsCluster.Id
+      ComputeNodeGroupConfigurations:
+        - ComputeNodeGroupId: !GetAtt GpuNodeGroup.Id
 
   # --- NLB (conditional) ---
 
