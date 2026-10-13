@@ -111,10 +111,28 @@ OVERRIDES="${OVERRIDES} VpcCidr=${VPC_CIDR}"
 [ -n "${PWB_VERSION_SHORT:-}" ] && OVERRIDES="${OVERRIDES} PwbVersionShort=${PWB_VERSION_SHORT}"
 [ -n "${MAX_GPU_NODES:-}" ] && OVERRIDES="${OVERRIDES} MaxGpuNodes=${MAX_GPU_NODES}"
 
+# Template exceeds the 51,200-byte inline limit, so deploy stages it in S3. The bucket must be
+# in the stack's region (deploy builds the URL from the regional endpoint), so CONFIG_BUCKET
+# can't be reused in general; default to a per-account/region bucket, created on first use.
+if [ -z "${CFN_BUCKET:-}" ]; then
+  ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text --region "$REGION")
+  CFN_BUCKET="cfn-templates-${ACCOUNT_ID}-${REGION}"
+fi
+if ! aws s3api head-bucket --bucket "$CFN_BUCKET" --region "$REGION" 2>/dev/null; then
+  echo "Creating template bucket ${CFN_BUCKET}..."
+  if [ "$REGION" = "us-east-1" ]; then
+    aws s3api create-bucket --bucket "$CFN_BUCKET" --region "$REGION"
+  else
+    aws s3api create-bucket --bucket "$CFN_BUCKET" --region "$REGION" \
+      --create-bucket-configuration LocationConstraint="$REGION"
+  fi
+fi
+
 echo "Deploying PCS stack: ${STACK_NAME}..."
 aws cloudformation deploy \
   --template-file "${SCRIPT_DIR}/pcs-cluster.yaml" \
   --stack-name "$STACK_NAME" \
+  --s3-bucket "$CFN_BUCKET" --s3-prefix "$STACK_NAME" \
   --capabilities CAPABILITY_NAMED_IAM \
   --parameter-overrides $OVERRIDES \
   --region "$REGION"

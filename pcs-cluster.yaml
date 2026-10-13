@@ -500,6 +500,19 @@ Resources:
               'ExecStart=' \
               'ExecStart=/bin/bash -c "source /etc/profile.d/slurm.sh && exec /usr/lib/rstudio-server/bin/rstudio-launcher"' \
               > /etc/systemd/system/rstudio-launcher.service.d/slurm-env.conf
+            # Keep retrying instead of giving up: PCS configures Slurm only after UserData finishes,
+            # so the launcher fails (scontrol DNS SRV lookup) until then and would otherwise hit the
+            # start limit after 5 quick failures and stay dead, taking rserver down with it.
+            for UNIT in rstudio-launcher rstudio-server; do
+              mkdir -p /etc/systemd/system/$UNIT.service.d
+              printf '%s\n' \
+                '[Unit]' \
+                'StartLimitIntervalSec=0' \
+                '[Service]' \
+                'Restart=always' \
+                'RestartSec=10' \
+                > /etc/systemd/system/$UNIT.service.d/restart.conf
+            done
             systemctl daemon-reload
 
             # One-time S3 config sync (first node only)
@@ -549,6 +562,13 @@ Resources:
               id "$USER" &>/dev/null || useradd -m -u "200${!i}" -s /bin/bash "$USER"
               echo "$USER:rstudio" | chpasswd
             done
+
+            # Refresh config from S3 on every boot so config changes reach replaced login nodes
+            # (the one-time sync above also generates keys / audit DB; cp never deletes those)
+            if [ -n "${ConfigBucket}" ]; then
+              aws s3 cp --recursive "s3://${ConfigBucket}/${ConfigPrefix}/" /opt/shared/rstudio/config/ \
+                || echo "S3 config refresh failed (non-fatal), using EFS copy"
+            fi
 
             # Deploy shared config files from EFS
             if [ -d /opt/shared/rstudio/config ]; then
@@ -668,34 +688,65 @@ Resources:
             # activate PWB license 
             /usr/lib/rstudio-server/bin/license-manager activate ${PwbLicense}
 
-            # stop rstudio server and launcher - clean out log files and restart 
-            rstudio-server stop 
-            rstudio-launcher stop 
+            # Stop rstudio server and launcher - clean out log files and restart.
+            # --no-block: the launcher can't come up until PCS configures Slurm *after* UserData,
+            # so a blocking start must not hold up the bootstrap; Restart=always retries it.
+            systemctl stop rstudio-server rstudio-launcher
             rm -rf /var/log/rstudio/*/*
-            rstudio-launcher start
-            rstudio-server start
+            systemctl reset-failed rstudio-launcher rstudio-server || true
+            systemctl start --no-block rstudio-launcher rstudio-server
 
             # Remove stale Workbench nodes: replaced login nodes keep their entry in the shared DB,
             # and rserver keeps contacting them (connection timeouts -> DB pool timeouts -> segfault loop).
-            # Keep only the IPs of live instances in this login node group. Non-fatal.
-            (
-              TOKEN=$(curl -sX PUT http://169.254.169.254/latest/api/token -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
-              INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
-              NODE_GROUP_ID=$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" --region ${AWS::Region} \
-                --query 'Reservations[0].Instances[0].Tags[?Key==`aws:pcs:compute-node-group-id`].Value' --output text)
-              LOGIN_IPS=$(aws ec2 describe-instances --region ${AWS::Region} \
-                --filters "Name=tag:aws:pcs:compute-node-group-id,Values=$NODE_GROUP_ID" "Name=instance-state-name,Values=pending,running" \
-                --query 'Reservations[].Instances[].PrivateIpAddress' --output text)
-              if [ -n "$NODE_GROUP_ID" ] && [ "$NODE_GROUP_ID" != "None" ] && [ -n "$LOGIN_IPS" ]; then
-                rstudio-server list-nodes | awk '$1 ~ /^[0-9]+$/ {print $1, $3}' | while read -r NODE_ID NODE_IP; do
-                  if ! grep -qwF "$NODE_IP" <<< "$LOGIN_IPS"; then
-                    echo "Deleting stale Workbench node $NODE_ID ($NODE_IP)"
-                    # delete-node can hang calling /stop-node on the dead host
-                    timeout 60 rstudio-server delete-node "$NODE_ID" || echo "delete-node $NODE_ID timed out/failed"
-                  fi
-                done
+            # Runs from a systemd timer (every 10 min, first run right away) rather than once at boot,
+            # because during a rolling replacement the old nodes may still be alive when new ones boot.
+            apt-get install -y postgresql-client
+            cat > /usr/local/sbin/pwb-prune-nodes <<'SCRIPT'
+            #!/bin/bash
+            # Delete Workbench nodes whose IP isn't a live instance in this login node group
+            set -uo pipefail
+            TOKEN=$(curl -sX PUT http://169.254.169.254/latest/api/token -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
+            INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
+            NODE_GROUP_ID=$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" --region ${AWS::Region} \
+              --query 'Reservations[0].Instances[0].Tags[?Key==`aws:pcs:compute-node-group-id`].Value' --output text)
+            [ -n "$NODE_GROUP_ID" ] && [ "$NODE_GROUP_ID" != "None" ] || exit 0
+            LOGIN_IPS=$(aws ec2 describe-instances --region ${AWS::Region} \
+              --filters "Name=tag:aws:pcs:compute-node-group-id,Values=$NODE_GROUP_ID" "Name=instance-state-name,Values=pending,running" \
+              --query 'Reservations[].Instances[].PrivateIpAddress' --output text)
+            [ -n "$LOGIN_IPS" ] || exit 0
+            NODES=$(timeout 60 rstudio-server list-nodes | awk '$1 ~ /^[0-9]+$/ {print $1, $3}') || exit 0
+            while read -r NODE_ID NODE_IP; do
+              [ -n "$NODE_ID" ] || continue
+              grep -qwF "$NODE_IP" <<< "$LOGIN_IPS" && continue
+              echo "Deleting stale Workbench node $NODE_ID ($NODE_IP)"
+              # delete-node asks for confirmation on stdin, and can hang calling /stop-node on the
+              # dead host -> fall back to deleting the DB row (id is a text column)
+              if ! echo yes | timeout 60 rstudio-server delete-node "$NODE_ID"; then
+                echo "delete-node $NODE_ID failed/timed out, deleting DB row"
+                PGPASSWORD='${RdsPassword}' psql -h '${RdsEndpoint}' -U rstudio -d pwb \
+                  -c "DELETE FROM node WHERE id='$NODE_ID'" || echo "DB delete of node $NODE_ID failed"
               fi
-            ) || echo "Stale Workbench node cleanup failed (non-fatal)"
+            done <<< "$NODES"
+            SCRIPT
+            chmod 0700 /usr/local/sbin/pwb-prune-nodes
+            printf '%s\n' \
+              '[Unit]' \
+              'Description=Remove stale Posit Workbench login nodes' \
+              '[Service]' \
+              'Type=oneshot' \
+              'ExecStart=/usr/local/sbin/pwb-prune-nodes' \
+              > /etc/systemd/system/pwb-prune-nodes.service
+            printf '%s\n' \
+              '[Unit]' \
+              'Description=Periodically remove stale Posit Workbench login nodes' \
+              '[Timer]' \
+              'OnActiveSec=2min' \
+              'OnUnitActiveSec=10min' \
+              '[Install]' \
+              'WantedBy=timers.target' \
+              > /etc/systemd/system/pwb-prune-nodes.timer
+            systemctl daemon-reload
+            systemctl enable --now pwb-prune-nodes.timer
 
             echo "Login node bootstrap complete."
             --==BOUNDARY==--
